@@ -1,0 +1,37 @@
+[project]
+name = "evolve-rfc"
+version = "0.1.0"
+description = "RFC智能体协同评审系统 - 基于多智能体的RFC自动化评审工作流"
+authors = [
+    {name = "EvolveRFC Team", email = "team@evolverfc.dev"}
+]
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0.5",
+    "langchain-core>=1.2.6",
+    "pydantic>=2.0.0",
+    "pyyaml>=6.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.3.0",
+    "mypy>=1.8.0",
+]
+
+[tool.pdm]
+distribution = false
+
+[build-system]
+requires = ["pdm-backend"]
+build-backend = "pdm.backend"
+
+
+[tool.pdm.scripts]
+workflow = "python -m evolve_rfc.workflow"
+nightly = "python -m evolve_rfc.nightly.daemon"
+test = "pytest -v"
+format = "ruff format ."

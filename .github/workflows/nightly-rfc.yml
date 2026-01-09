@@ -1,0 +1,92 @@
+name: Nightly RFC Daemon
+
+on:
+  # 每日UTC 0:00触发
+  schedule:
+    - cron: '0 0 * * *'
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: false
+        default: 'random'
+        type: choice
+        options:
+          - random
+          - audit
+          - pre_discussion
+          - creative
+
+env:
+  MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+
+jobs:
+  nightly-rfc:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'your-username'  # 替换为你的用户名
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # 需要完整历史用于代码分析
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync
+
+      - name: Run Nightly Daemon
+        id: nightly
+        run: |
+          echo "🚀 启动夜间守护进程（GitHub Action模式）..."
+
+          # 根据输入参数或随机选择模式
+          MODE="${{ github.event.inputs.mode || 'random' }}"
+          uv run python -m evolve_rfc.nightly.daemon --mode "$MODE"
+
+          # 检查是否有输出文件
+          if ls nightly_output/*.md 1> /dev/null 2>&1; then
+            echo "✅ 发现输出文件"
+
+            # 获取输出文件名
+            OUTPUT_FILE=$(ls -t nightly_output/*.md | head -1)
+            echo "output_file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
+
+            # 读取输出内容用于通知
+            echo "content=$(cat $OUTPUT_FILE | head -c 200)..." >> $GITHUB_OUTPUT
+          else
+            echo "📭 当日无输出（静默结束）"
+          fi
+
+      - name: Create Pull Request (if output exists)
+        if: steps.nightly.outputs.output_file != ''
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GH_TOKEN }}
+          commit-message: "🤖 Nightly: $(date +%Y-%m-%d)"
+          title: "📋 RFC Nightly Output - $(date +%Y-%m-%d)"
+          body: |
+            夜间守护进程输出结果
+
+            ## 概览
+            ${{ steps.nightly.outputs.content }}
+
+            由 @github-actions[bot] 自动生成
+          branch: nightly/$(date +%Y-%m-%d)
+          delete-branch: true
+
+      - name: Send Notification (Slack/Discord)
+        if: steps.nightly.outputs.output_file != ''
+        run: |
+          # Slack通知示例
+          curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🌙 夜间守护进程已生成新的RFC输出，请查看：https://github.com/${{ github.repository }}/pull/new/nightly/$(date +%Y-%m-%d)"}' \
+            ${{ secrets.SLACK_WEBHOOK_URL }}
