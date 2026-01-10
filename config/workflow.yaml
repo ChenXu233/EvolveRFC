@@ -1,5 +1,5 @@
-# EvolveRFC 工作流配置示例
-# 完整配置参考，复制为 config/workflow.yaml 使用
+# EvolveRFC 工作流配置
+# 角色支持动态配置，可随时启用/禁用/添加
 
 # ============================================
 # 路由规则配置
@@ -63,7 +63,7 @@ roles:
     #   model: gpt-4o
     #   temperature: 0.7
     #   base_url: https://api.openai.com/v1  # 代理地址
-    #   api_key: ""  # 角色专属 API 密钥
+    #   api_key: ""  # 可选：角色专属 API 密钥
 
   # === 安全偏执狂 ===
   # 职责：识别安全漏洞、检查数据保护、评估认证授权
@@ -78,7 +78,7 @@ roles:
       model: claude-sonnet-4-20250514
       temperature: 0.3  # 安全分析需要更低的温度
       # base_url: https://api.anthropic.com  # Anthropic API 地址
-      # api_key: ""  # 角色专属 API 密钥（可与全局不同）
+      # api_key: ""  # 可选：角色专属 API 密钥
 
   # === 成本控制型运维 ===
   # 职责：评估基础设施成本、检查运维复杂度、监控可观测性
@@ -92,7 +92,7 @@ roles:
     #   provider: openai
     #   model: gpt-4o-mini
     #   temperature: 0.5
-    #   api_key: ""  # 角色专属 API 密钥
+    #   api_key: ""  # 可选：角色专属 API 密钥
 
   # === 激进创新派 ===
   # 职责：评估新技术可能性、挑战保守设计、提出创新建议
@@ -106,7 +106,7 @@ roles:
     #   provider: openai
     #   model: gpt-4o
     #   temperature: 1.0  # 更高的温度产生更多创意
-    #   api_key: ""  # 角色专属 API 密钥
+    #   api_key: ""  # 可选：角色专属 API 密钥
 
   # === 书记官 ===
   # 职责：总结讨论、提炼共识、起草报告（不参与投票）
@@ -119,56 +119,14 @@ roles:
     # llm:
     #   provider: openai
     #   model: gpt-4o-mini
-    #   api_key: ""  # 角色专属 API 密钥
-
-  # === 自定义角色示例：性能优化专家 ===
-  # 取消注释以启用此角色
-  # performance:
-  #   enabled: true
-  #   must_speak: true
-  #   can_vote: true
-  #   prompt_file: prompts/performance.txt
-  #   # 性能分析使用 Claude
-  #   llm:
-  #     provider: anthropic
-  #     model: claude-sonnet-4-20250514
-  #     api_key: ""  # 角色专属 API 密钥
+    #   api_key: ""  # 可选：角色专属 API 密钥
 
 # ============================================
-# API 密钥配置优先级
+# API 密钥配置（敏感信息，会被 .gitignore 忽略）
 # ============================================
-# 1. 角色的 llm.api_key（最高优先级）
-# 2. 环境变量 (OPENAI_API_KEY / ANTHROPIC_API_KEY)
-# 3. 全局 llm.api_key
+# 优先级：角色配置 > 环境变量 > 全局配置
+# 建议优先使用环境变量，其次在角色配置中指定
 #
-# 建议：敏感信息使用环境变量或角色专属配置
-#
-# 环境变量设置示例：
+# 环境变量设置：
 # export OPENAI_API_KEY="sk-..."
 # export ANTHROPIC_API_KEY="sk-ant-..."
-
-# ============================================
-# 代理配置示例
-# ============================================
-# 如果需要使用代理或第三方兼容 API：
-# llm:
-#   provider: openai
-#   model: gpt-4o
-#   base_url: https://your-proxy.com/v1  # 代理地址
-#
-# 角色也可以单独配置代理：
-# roles:
-#   security:
-#     llm:
-#       base_url: https://your-proxy.com/v1
-
-# ============================================
-# 添加自定义角色的步骤
-# ============================================
-# 1. 在 roles 下添加角色配置
-# 2. 创建 prompts/{角色名}.txt 提示词文件
-# 3. 重启服务即可生效
-#
-# 提示词文件格式：
-# - 系统角色定义
-# - 评审输出格式（论点、论据、立场、置信度）

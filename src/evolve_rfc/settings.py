@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 
 ProviderType = Literal["openai", "anthropic"]
@@ -20,6 +20,17 @@ class BaseLLMConfig(BaseModel):
     base_url: Optional[str] = None  # 自定义 API 地址（用于代理或第三方兼容 API）
     timeout: Optional[float] = None  # Anthropic 超时时间（秒）
     stop: Optional[List[str]] = None  # Anthropic 停止词
+    api_key: Optional[SecretStr] = None  # API 密钥（敏感信息，会被 .gitignore 忽略）
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_api_key_to_secret_str(cls, data: dict) -> dict:
+        """自动将字符串类型的 api_key 转换为 SecretStr"""
+        if isinstance(data, dict) and "api_key" in data:
+            api_key = data["api_key"]
+            if isinstance(api_key, str):
+                data["api_key"] = SecretStr(api_key)
+        return data
 
 
 class RoleConfig(BaseModel):
@@ -28,7 +39,7 @@ class RoleConfig(BaseModel):
     must_speak: bool = False  # 是否必须发言
     can_vote: Optional[bool] = None  # 是否有投票权，默认根据 must_speak 自动推断
     prompt_file: str = ""
-    # 可选：覆盖全局 LLM 设置
+    # 可选：覆盖全局 LLM 设置（包括 provider, model, temperature, base_url, api_key 等）
     llm: Optional[BaseLLMConfig] = None
 
 
@@ -217,11 +228,39 @@ def reload_settings() -> Settings:
 
 
 def get_role_llm_config(role_name: str) -> BaseLLMConfig:
-    """获取角色的 LLM 配置（优先使用角色自己的配置，否则使用全局配置）"""
+    """获取角色的 LLM 配置
+
+    合并逻辑：角色的配置覆盖全局配置，未配置的字段使用全局默认值
+    优先级：角色配置 > 全局配置
+
+    API 密钥优先级：角色配置 > 环境变量 > 全局配置
+    """
+    import os
+
     settings = get_settings()
+    global_config = settings.workflow.llm
     role_config = settings.workflow.roles.get(role_name)
 
+    # 获取角色的 LLM 配置（角色覆盖全局）
     if role_config and role_config.llm:
-        return role_config.llm
+        merged = global_config.model_copy(
+            update=role_config.llm.model_dump(exclude_unset=True)
+        )
+    else:
+        merged = global_config
 
-    return settings.workflow.llm
+    # 合并 API 密钥（优先级：角色配置 > 环境变量 > 全局）
+    if merged.api_key is None:
+        provider = merged.provider
+        env_key = None
+        if provider == "openai":
+            env_key = os.environ.get("OPENAI_API_KEY")
+        elif provider == "anthropic":
+            env_key = os.environ.get("ANTHROPIC_API_KEY")
+
+        if env_key:
+            merged.api_key = SecretStr(env_key)
+        elif global_config.api_key:
+            merged.api_key = global_config.api_key
+
+    return merged
