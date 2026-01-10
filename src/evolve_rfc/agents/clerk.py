@@ -6,14 +6,14 @@
 from typing import Optional
 from langchain_openai import ChatOpenAI
 from ..agents.base import BaseAgent, AgentResult
-from ..agents.roles import RoleType, get_role_prompt
+from ..agents.roles import get_role_prompt
 
 
 class ClerkAgent(BaseAgent):
     """书记官智能体"""
 
     def __init__(self, llm_client: ChatOpenAI):
-        super().__init__(llm_client, get_role_prompt(RoleType.CLERK))
+        super().__init__(llm_client, get_role_prompt("clerk"))
 
     def run(
         self,

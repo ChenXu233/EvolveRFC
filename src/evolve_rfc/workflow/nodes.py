@@ -1,37 +1,58 @@
 """工作流节点定义
 """
 
-from typing import Optional
-from langgraph.graph import StateGraph
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from ..settings import get_role_llm_config, BaseLLMConfig
 from ..core.state import (
     DiscussionState,
     DiscussionEvent,
     EventType,
     add_event,
 )
-from ..core.router import default_router, RouteTarget
-from ..agents import get_role_prompt, RoleType
-from ..shared import run_parallel_review, analyze_votes
+from ..core.router import default_router
+from ..agents import get_role_prompt, get_reviewer_roles
+from ..shared import run_parallel_review
 
 
-# 全局LLM客户端（后续可通过依赖注入）
-_llm_client: Optional[ChatOpenAI] = None
+# 全局 LLM 客户端缓存
+_llm_clients: dict[str, ChatOpenAI | ChatAnthropic] = {}
 
 
-def set_llm_client(client: ChatOpenAI):
-    """设置全局LLM客户端"""
-    global _llm_client
-    _llm_client = client
+def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
+    """根据配置创建 LLM 客户端"""
+    if config.provider == "openai":
+        return ChatOpenAI(
+            model=config.model,
+            temperature=config.temperature,
+            base_url=config.base_url,
+        )
+    elif config.provider == "anthropic":
+        return ChatAnthropic(
+            model_name=config.model,
+            temperature=config.temperature,
+            base_url=config.base_url,
+            timeout=config.timeout,
+            stop=config.stop,
+        )
+    else:
+        raise ValueError(f"不支持的 provider: {config.provider}")
 
 
-def get_llm_client() -> ChatOpenAI:
-    """获取全局LLM客户端"""
-    if _llm_client is None:
-        raise RuntimeError("LLM客户端未初始化，请先调用 set_llm_client()")
-    return _llm_client
+def get_llm_client(role_name: str | None = None) -> ChatOpenAI | ChatAnthropic:
+    """获取 LLM 客户端（按角色名称，支持缓存）"""
+    key = role_name or "__global__"
+
+    if key not in _llm_clients:
+        if role_name:
+            config = get_role_llm_config(role_name)
+        else:
+            config = get_role_llm_config("architect")  # 使用全局配置
+        _llm_clients[key] = _create_llm_client(config)
+
+    return _llm_clients[key]
 
 
 def init_node(state: DiscussionState) -> DiscussionState:
@@ -41,13 +62,11 @@ def init_node(state: DiscussionState) -> DiscussionState:
 
 def parallel_review_node(state: DiscussionState) -> DiscussionState:
     """并行评审节点 - 多个角色同时评审"""
-    client = get_llm_client()
     rfc_content = state["rfc_content"]
     current_round = state["current_round"]
 
     # 使用共享的并行评审逻辑
     review_results = run_parallel_review(
-        client=client,
         content=rfc_content,
         current_round=current_round,
     )
@@ -115,13 +134,12 @@ def vote_analyzer_node(state: DiscussionState) -> DiscussionState:
 
 def human_oversight_node(state: DiscussionState) -> DiscussionState:
     """人类监督节点 - 工作流暂停，等待人类输入"""
-    # 此节点是 interrupt 节点，实际处理在外部
     return state
 
 
 def clerk_summary_node(state: DiscussionState) -> DiscussionState:
     """书记官总结节点"""
-    client = get_llm_client()
+    client = get_llm_client("clerk")
     current_round = state["current_round"]
 
     # 收集本轮事件
@@ -145,10 +163,10 @@ def clerk_summary_node(state: DiscussionState) -> DiscussionState:
 
     try:
         response = client.invoke([
-            SystemMessage(content=get_role_prompt(RoleType.CLERK)),
+            SystemMessage(content=get_role_prompt("clerk")),
             HumanMessage(content=input_text),
         ])
-        content = response.content if hasattr(response, 'content') else str(response)
+        content = response.content
 
         # 添加澄清事件
         clarification_event = DiscussionEvent(
@@ -176,7 +194,6 @@ def clerk_summary_node(state: DiscussionState) -> DiscussionState:
 
 def timeout_checker_node(state: DiscussionState) -> DiscussionState:
     """超时检测节点"""
-    # 简化实现：仅更新超时计数
     if state.get("awaiting_human_input", False):
         state["timeout_count"] = state.get("timeout_count", 0) + 1
     return state
@@ -184,16 +201,10 @@ def timeout_checker_node(state: DiscussionState) -> DiscussionState:
 
 def final_report_node(state: DiscussionState) -> DiscussionState:
     """最终报告生成节点"""
-    # 状态标记为完成
     state["workflow_status"] = "已完成"
     return state
 
 
-def get_all_reviewer_roles() -> list[RoleType]:
-    """获取所有评审者角色"""
-    return [
-        RoleType.ARCHITECT,
-        RoleType.SECURITY,
-        RoleType.COST_CONTROL,
-        RoleType.INNOVATOR,
-    ]
+def get_all_reviewer_roles() -> list[str]:
+    """获取所有评审者角色（从配置动态读取）"""
+    return get_reviewer_roles()

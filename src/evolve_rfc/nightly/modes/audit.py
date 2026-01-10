@@ -4,25 +4,40 @@
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, TYPE_CHECKING
 import json
-import os
 
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from ..settings import get_settings
 
-def _create_client() -> ChatOpenAI:
-    """创建LLM客户端"""
-    api_key = os.getenv("MINIMAX_API_KEY")
-    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat")
-    if not api_key:
-        raise ValueError("MINIMAX_API_KEY 未设置")
-    return ChatOpenAI(
-        model="minimax-m2.1",
-        api_key=api_key,
-        base_url=base_url,
-    )
+if TYPE_CHECKING:
+    pass
+
+
+def _create_client():
+    """创建 LLM 客户端（使用全局配置）"""
+    settings = get_settings()
+    llm_config = settings.workflow.llm
+
+    if llm_config.provider == "openai":
+        return ChatOpenAI(
+            model=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+        )
+    elif llm_config.provider == "anthropic":
+        return ChatAnthropic(
+            model_name=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+            timeout=llm_config.timeout,
+            stop=llm_config.stop,
+        )
+    else:
+        raise ValueError(f"不支持的 provider: {llm_config.provider}")
 
 
 def run_audit_mode(config: Dict[str, Any], output_dir: str):
@@ -30,9 +45,10 @@ def run_audit_mode(config: Dict[str, Any], output_dir: str):
     print("🔍 进入深度审计模式...")
 
     # 加载配置
-    audit_config = config.get("nightly", {}).get("code_analysis", {})
-    scope = audit_config.get("scope", "diff")
-    focus_dirs = audit_config.get("focus_dirs", ["src"])
+    settings = get_settings()
+    audit_config = settings.nightly.code_analysis
+    scope = audit_config.scope
+    focus_dirs = audit_config.focus_dirs
 
     # 获取代码
     code_files = _collect_code_files(focus_dirs)
@@ -44,7 +60,7 @@ def run_audit_mode(config: Dict[str, Any], output_dir: str):
 
     # 分析代码
     client = _create_client()
-    issues = _analyze_code(client, code_files, scope)
+    issues = _analyze_code(client, code_files, scope, audit_config)
 
     # 生成报告
     if issues:
@@ -66,41 +82,23 @@ def _collect_code_files(dirs: list) -> list:
     return [str(f) for f in code_files[:50]]  # 限制数量
 
 
-def _analyze_code(client: ChatOpenAI, files: list, scope: str) -> list:
+def _analyze_code(client, files: list, scope: str, audit_config) -> list:
     """分析代码"""
     issues = []
 
-    # 构建提示词
-    prompt = f"""你是一个苛刻的代码审查员。分析以下代码，目标是找出：
-1. 设计反模式（单点故障、紧耦合、过度复杂、违反SOLID）
-2. 潜在缺陷（资源泄漏、并发问题、安全漏洞、未处理边界）
-3. 技术债务（重复代码、硬编码、魔法数字、缺失注释/测试）
-
-请输出JSON格式：
-{{
-  "问题列表": [
-    {{
-      "文件": "路径",
-      "行号": 行号,
-      "描述": "问题描述",
-      "严重性": "高|中|低",
-      "改进建议": "一句话建议"
-    }}
-  ]
-}}
-
-分析范围：{"最新Diff" if scope == "diff" else "全量代码"}
-"""
-
-    # 简化实现：分析前10个文件
-    for file_path in files[:10]:
+    # 简化实现：分析前 max_files_analyze 个文件
+    files_to_analyze = files[:audit_config.max_files_analyze]
+    for file_path in files_to_analyze:
         try:
             content = Path(file_path).read_text(encoding="utf-8")[:3000]
             response = client.invoke([
-                SystemMessage(content=prompt),
-                HumanMessage(content=f"文件: {file_path}\n\n{content}"),
+                SystemMessage(content=audit_config.system_prompt),
+                HumanMessage(content=audit_config.user_prompt_template.format(
+                    file_path=file_path,
+                    file_content=content
+                )),
             ])
-            response_text = response.content if hasattr(response, 'content') else str(response)
+            response_text = response.content
 
             # 解析结果
             result = _parse_response(response_text)

@@ -48,7 +48,7 @@ class WorkflowRouter:
         return [
             RoutingRule(
                 name="emergency_stop",
-                condition=lambda s: s.get("human_decision", {}).get("action") == "终止",
+                condition=lambda s: (s.get("human_decision") or {}).get("action") == "终止",
                 priority=1,
                 target=RouteTarget.EMERGENCY_STOP,
             ),

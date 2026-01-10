@@ -76,6 +76,10 @@ def run_local_mode(config: DaemonConfig):
     """本地模式运行"""
     from .modes import run_mode as run_nightly_mode
     from ..utils.config import load_nightly_config
+    from ..mcp.main import ensure_mcp_started
+
+    # 自动启动 MCP Server（让 AI 可以调用工具）
+    ensure_mcp_started()
 
     print(f"🚀 启动夜间守护进程（本地模式）...")
     print(f"📁 输出目录: {config.output_dir}")

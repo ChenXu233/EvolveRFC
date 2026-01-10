@@ -4,25 +4,40 @@
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, TYPE_CHECKING
 from datetime import datetime
-import os
 
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from ..settings import get_settings
 
-def _create_client() -> ChatOpenAI:
-    """创建LLM客户端"""
-    api_key = os.getenv("MINIMAX_API_KEY")
-    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat")
-    if not api_key:
-        raise ValueError("MINIMAX_API_KEY 未设置")
-    return ChatOpenAI(
-        model="minimax-m2.1",
-        api_key=api_key,
-        base_url=base_url,
-    )
+if TYPE_CHECKING:
+    pass
+
+
+def _create_client():
+    """创建 LLM 客户端（使用全局配置）"""
+    settings = get_settings()
+    llm_config = settings.workflow.llm
+
+    if llm_config.provider == "openai":
+        return ChatOpenAI(
+            model=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+        )
+    elif llm_config.provider == "anthropic":
+        return ChatAnthropic(
+            model_name=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+            timeout=llm_config.timeout,
+            stop=llm_config.stop,
+        )
+    else:
+        raise ValueError(f"不支持的 provider: {llm_config.provider}")
 
 
 def run_discuss_mode(config: Dict[str, Any], output_dir: str):
@@ -30,8 +45,9 @@ def run_discuss_mode(config: Dict[str, Any], output_dir: str):
     print("💬 进入现有RFC预讨论模式...")
 
     # 加载配置
-    discuss_config = config.get("nightly", {}).get("rfc_pre_discussion", {})
-    max_rfcs = discuss_config.get("max_rfcs_per_night", 5)
+    settings = get_settings()
+    discuss_config = settings.nightly.rfc_pre_discussion
+    max_rfcs = discuss_config.max_rfcs_per_night
 
     # 收集待评审RFC
     rfc_files = _collect_pending_rfcs()
@@ -50,7 +66,7 @@ def run_discuss_mode(config: Dict[str, Any], output_dir: str):
 
     for rfc_path in rfc_files:
         try:
-            result = _pre_discuss_rfc(client, rfc_path)
+            result = _pre_discuss_rfc(client, rfc_path, discuss_config)
             if result:
                 results.append(result)
         except Exception as e:
@@ -85,40 +101,18 @@ def _collect_pending_rfcs() -> list:
     return sorted(pending, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _pre_discuss_rfc(client: MiniMaxClient, rfc_path: Path) -> dict:
+def _pre_discuss_rfc(client, rfc_path: Path, discuss_config) -> dict:
     """对单个RFC进行预讨论"""
     content = rfc_path.read_text(encoding="utf-8")[:5000]
 
-    prompt = """你是一个预讨论智能体，负责对RFC草案进行快速预审。
-
-请从以下角度快速评审：
-1. 核心观点是否清晰
-2. 主要优点
-3. 潜在风险点
-4. 建议修改
-
-输出格式：
-```yaml
-rfc_id: "RFC文件名"
-rfc_title: "标题"
-预审摘要:
-  核心观点: "一句话总结"
-  优点: ["优点1", "优点2"]
-  风险点: ["风险1", "风险2"]
-  建议修改: ["建议1", "建议2"]
-投票结果:
-  赞成: 2
-  反对: 1
-  弃权: 0
-置信度: 0.75
-```
-"""
-
     response = client.invoke([
-        SystemMessage(content=prompt),
-        HumanMessage(content=f"RFC文件: {rfc_path.name}\n\n{content}"),
+        SystemMessage(content=discuss_config.system_prompt),
+        HumanMessage(content=discuss_config.user_prompt_template.format(
+            rfc_path=rfc_path.name,
+            rfc_content=content
+        )),
     ])
-    response_text = response.content if hasattr(response, 'content') else str(response)
+    response_text = response.content
 
     # 解析结果
     result = _parse_response(response_text, rfc_path.name)
@@ -138,7 +132,6 @@ def _parse_response(response: str, filename: str) -> dict:
             "建议修改": [],
         },
         "投票结果": {"赞成": 0, "反对": 0, "弃权": 0},
-        "置信度": 0.5,
     }
 
     # 简单解析
@@ -166,8 +159,6 @@ def _generate_summary_report(results: list) -> str:
 **核心观点**: {result['预审摘要']['核心观点']}
 
 **投票结果**: 赞成{result['投票结果']['赞成']} / 反对{result['投票结果']['反对']} / 弃权{result['投票结果']['弃权']}
-
-**置信度**: {result['置信度']}
 
 ---
 """

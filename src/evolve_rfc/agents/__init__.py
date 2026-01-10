@@ -2,12 +2,15 @@
 """
 
 from .base import BaseAgent
-from .roles import RoleType, get_role_prompt
+from .roles import RoleType, get_role_prompt, get_active_roles, get_reviewer_roles, is_voter
 from .clerk import ClerkAgent
 
 __all__ = [
     "BaseAgent",
-    "RoleType",
+    "RoleType",  # 类型别名: str
     "get_role_prompt",
+    "get_active_roles",
+    "get_reviewer_roles",
+    "is_voter",
     "ClerkAgent",
 ]

@@ -4,27 +4,41 @@
 """
 
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, TYPE_CHECKING
 from datetime import datetime
-import os
 
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from ...settings import get_settings
 from ...shared import run_parallel_review, analyze_votes, check_approval
 
+if TYPE_CHECKING:
+    pass
 
-def _create_client() -> ChatOpenAI:
-    """创建LLM客户端"""
-    api_key = os.getenv("MINIMAX_API_KEY")
-    base_url = os.getenv("MINIMAX_BASE_URL", "https://api.minimax.chat")
-    if not api_key:
-        raise ValueError("MINIMAX_API_KEY 未设置")
-    return ChatOpenAI(
-        model="minimax-m2.1",
-        api_key=api_key,
-        base_url=base_url,
-    )
+
+def _create_client():
+    """创建 LLM 客户端（使用全局配置）"""
+    settings = get_settings()
+    llm_config = settings.workflow.llm
+
+    if llm_config.provider == "openai":
+        return ChatOpenAI(
+            model=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+        )
+    elif llm_config.provider == "anthropic":
+        return ChatAnthropic(
+            model_name=llm_config.model,
+            temperature=llm_config.temperature,
+            base_url=llm_config.base_url,
+            timeout=llm_config.timeout,
+            stop=llm_config.stop,
+        )
+    else:
+        raise ValueError(f"不支持的 provider: {llm_config.provider}")
 
 
 def run_creative_mode(config: Dict[str, Any], output_dir: str):
@@ -32,12 +46,13 @@ def run_creative_mode(config: Dict[str, Any], output_dir: str):
     print("💡 进入创新提案模式...")
 
     # 加载配置
-    creative_config = config.get("nightly", {}).get("creative_proposal", {})
-    max_rounds = creative_config.get("max_rounds", 5)
+    settings = get_settings()
+    creative_config = settings.nightly.creative_proposal
+    max_rounds = creative_config.max_rounds
 
     # 生成创新想法
     client = _create_client()
-    ideas = _generate_ideas(client, config)
+    ideas = _generate_ideas(client, config, creative_config)
 
     if not ideas:
         print("📭 无创新想法，静默结束")
@@ -45,10 +60,13 @@ def run_creative_mode(config: Dict[str, Any], output_dir: str):
 
     # 多轮辩论审核（复用 shared/debate.py）
     approved_proposals = []
+    controversial_ideas = []  # 收集未通过的ideas，避免重复辩论
     for idea in ideas:
-        result = _multi_round_debate(client, idea, max_rounds)
+        result = _multi_round_debate(idea, max_rounds, creative_config)
         if result["approved"]:
             approved_proposals.append(result)
+        else:
+            controversial_ideas.append(result["idea"])
 
     # 生成输出
     if approved_proposals:
@@ -57,41 +75,25 @@ def run_creative_mode(config: Dict[str, Any], output_dir: str):
         print(f"✅ 产生 {len(approved_proposals)} 个通过审核的提案")
     else:
         # 输出有争议ideas列表
-        controversial_list = [
-            r["idea"] for r in [_multi_round_debate(client, idea, max_rounds) for idea in ideas]
-            if not r["approved"]
-        ]
-        if controversial_list:
-            report = _generate_controversial_report(controversial_list)
+        if controversial_ideas:
+            report = _generate_controversial_report(controversial_ideas)
             _save_output(output_dir, "controversial_ideas.md", report)
-            print(f"📋 产生 {len(controversial_list)} 个有争议的ideas")
+            print(f"📋 产生 {len(controversial_ideas)} 个有争议的ideas")
         else:
             print("📭 无有效提案，静默结束")
 
 
-def _generate_ideas(client: ChatOpenAI, config: dict) -> list:
+def _generate_ideas(client, config: dict, creative_config) -> list:
     """生成创新想法"""
-    prompt = """你是一个首席技术布道师，负责提出大胆但可行的改进想法。
+    prompt = creative_config.system_prompt
 
-基于以下上下文，提出1-3个创新RFC想法：
-1. 当前项目技术栈
-2. 行业趋势
-3. 潜在改进方向
-
-每个想法请输出：
-- 标题：一句话描述
-- 动机：为什么需要这个改进
-- 核心方案：简要描述实现方案
-- 预期收益：带来的价值
-
-请直接输出，不要使用markdown格式。
-"""
-
-    response = client.invoke([
-        SystemMessage(content=prompt),
-        HumanMessage(content="请提出创新RFC想法。"),
-    ])
-    response_text = response.content if hasattr(response, 'content') else str(response)
+    response = client.invoke(
+        [
+            SystemMessage(content=prompt),
+            HumanMessage(content=creative_config.user_prompt),
+        ]
+    )
+    response_text = response.content
 
     # 解析想法
     ideas = []
@@ -100,10 +102,10 @@ def _generate_ideas(client: ChatOpenAI, config: dict) -> list:
         if "标题:" in block or "动机:" in block:
             ideas.append({"content": block, "debate_history": []})
 
-    return ideas[:3]  # 最多3个
+    return ideas[: creative_config.max_ideas]
 
 
-def _multi_round_debate(client: ChatOpenAI, idea: dict, max_rounds: int) -> dict:
+def _multi_round_debate(idea: dict, max_rounds: int, approval_config) -> dict:
     """多轮辩论审核（复用 shared/debate.py 的核心逻辑）"""
     current_round = 0
     approved = False
@@ -114,7 +116,6 @@ def _multi_round_debate(client: ChatOpenAI, idea: dict, max_rounds: int) -> dict
 
         # 使用共享的并行评审逻辑
         review_results = run_parallel_review(
-            client=client,
             content=idea["content"],
             current_round=current_round,
         )
@@ -134,7 +135,14 @@ def _multi_round_debate(client: ChatOpenAI, idea: dict, max_rounds: int) -> dict
         })
 
         # 检查是否通过
-        approval = check_approval(vote_result, max_rounds, current_round)
+        approval = check_approval(
+            vote_result,
+            max_rounds,
+            current_round,
+            yes_votes_needed=approval_config.yes_votes_needed,
+            no_votes_limit=approval_config.no_votes_limit,
+            require_yes_over_no=approval_config.require_yes_over_no,
+        )
         if approval["approved"]:
             approved = True
             break
@@ -162,9 +170,9 @@ def _generate_proposal_report(proposals: list) -> str:
     for i, prop in enumerate(proposals, 1):
         report += f"""### 提案 {i}
 
-{prop['idea']['content']}
+{prop["idea"]["content"]}
 
-**辩论结果**: 赞成{prop['final_vote']['赞成']} / 反对{prop['final_vote']['反对']}
+**辩论结果**: 赞成{prop["final_vote"]["yes"]} / 反对{prop["final_vote"]["no"]}
 
 ---
 """

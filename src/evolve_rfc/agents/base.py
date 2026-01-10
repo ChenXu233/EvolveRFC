@@ -2,7 +2,7 @@
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Union, List
 from dataclasses import dataclass
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -24,13 +24,15 @@ class BaseAgent(ABC):
         self.system_prompt = system_prompt
 
     @abstractmethod
-    def run(self, input_text: str, context: Optional[dict] = None) -> AgentResult:
+    def run(self, *args, **kwargs) -> AgentResult:
         """执行智能体逻辑"""
         pass
 
-    def _build_messages(self, input_text: str, context: Optional[dict] = None) -> list:
+    def _build_messages(
+        self, input_text: str, context: Optional[dict] = None
+    ) -> list[object]:
         """构建消息列表（LangChain格式）"""
-        messages = [
+        messages: list[object] = [
             SystemMessage(content=self.system_prompt),
         ]
 

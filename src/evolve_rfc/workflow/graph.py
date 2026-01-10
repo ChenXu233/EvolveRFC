@@ -3,6 +3,8 @@
 
 from langgraph.graph import StateGraph, END
 
+from ..core.state import DiscussionState
+
 from .nodes import (
     init_node,
     parallel_review_node,
@@ -22,7 +24,7 @@ from .edges import (
 def build_workflow_graph():
     """构建评审工作流图"""
     # 创建状态图
-    graph = StateGraph(dict)
+    graph = StateGraph(DiscussionState)
 
     # 添加节点
     graph.add_node("init", init_node)
@@ -76,7 +78,7 @@ def build_review_workflow(max_rounds: int = 10):
     router = WorkflowRouter(max_rounds=max_rounds)
 
     # 创建状态图
-    graph = StateGraph(dict)
+    graph = StateGraph(DiscussionState)
 
     # 添加节点
     graph.add_node("init", init_node)
@@ -97,7 +99,7 @@ def build_review_workflow(max_rounds: int = 10):
     graph.add_edge("clerk_summary", "parallel_review")
 
     # 条件边 - 使用自定义路由器
-    def custom_route(state: dict) -> str:
+    def custom_route(state: DiscussionState) -> str:
         target = router.route(state)
 
         route_map = {

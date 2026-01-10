@@ -66,3 +66,7 @@ htmlcov/
 *.pyi
 
 .claude
+
+mcp.yaml
+nightly.yaml
+workflow.yaml

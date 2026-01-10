@@ -16,10 +16,10 @@ A multi-agent based RFC intelligent review system that simulates a "technical pa
 ## Tech Stack
 
 - **Language**: Python 3.11+
-- **Package Manager**: PDM
+- **Package Manager**: PDM / uv
 - **Core Framework**: LangGraph
-- **LLM**: MiniMax M2.1
-- **Configuration**: YAML
+- **LLM**: OpenAI (GPT-4o) / Anthropic (Claude)
+- **Configuration**: YAML (Pydantic Settings)
 
 ## Project Structure
 
@@ -29,7 +29,7 @@ src/evolve_rfc/
 ├── agents/         # Role prompts & agents
 ├── workflow/       # LangGraph workflow
 ├── nightly/        # Nightly daemon
-├── llm/            # LLM client (MiniMax)
+├── shared/         # Shared logic: debate, voting
 └── utils/          # Config & parsers
 ```
 
@@ -39,6 +39,7 @@ src/evolve_rfc/
 - `config/workflow.yaml` - Workflow configuration
 - `config/nightly.yaml` - Nightly daemon configuration
 - `prompts/*.txt` - Role prompt templates
+- `src/evolve_rfc/settings.py` - Pydantic Settings configuration
 
 ## Development Commands
 
@@ -54,6 +55,9 @@ uv run ruff check .
 
 # Run type checker
 uv run mypy src/
+
+# Run workflow
+uv run python -m evolve_rfc.workflow
 
 # Run nightly daemon
 uv run python -m evolve_rfc.nightly.daemon
@@ -84,7 +88,23 @@ Route logic is centralized in `WorkflowRouter` rather than scattered in nodes.
 - Reviewers (must vote): architect, security, cost_control, innovator
 - Service (no vote): clerk (summarizes discussions only)
 
+### LLM Configuration
+
+LLM providers are configured in `config/workflow.yaml`. Each role can override the global LLM settings:
+
+```yaml
+llm:  # Global default
+  provider: openai
+  model: gpt-4o
+
+roles:
+  architect:
+    llm:  # Optional: override for this role
+      provider: anthropic
+      model: claude-sonnet-4-20250514
+```
+
 ## Environment Variables
 
-- `MINIMAX_API_KEY` - MiniMax API key
-- `MINIMAX_BASE_URL` - MiniMax API base URL (optional)
+- `OPENAI_API_KEY` - OpenAI API key
+- `ANTHROPIC_API_KEY` - Anthropic API key
