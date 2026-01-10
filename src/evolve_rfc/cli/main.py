@@ -152,7 +152,7 @@ def main_menu():
             "请选择操作",
             choices=choices,
             style=custom_style,
-            default=0,
+            default="🚀 开始 RFC 评审工作流",
         ).ask()
 
         if choice == "🚀 开始 RFC 评审工作流" or choice is None:

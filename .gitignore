@@ -72,3 +72,6 @@ htmlcov/
 mcp.yaml
 nightly.yaml
 workflow.yaml
+src/evolve_rfc/cli/__pycache__/main.cpython-311.pyc
+src/evolve_rfc/ui/__pycache__/__init__.cpython-311.pyc
+src/evolve_rfc/ui/__pycache__/workflow.cpython-311.pyc
