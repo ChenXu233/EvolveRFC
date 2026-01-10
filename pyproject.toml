@@ -18,6 +18,9 @@ dependencies = [
     "mcp>=1.0.0",  # MCP Server 支持
     "fastapi>=0.100.0",  # HTTP MCP Server
     "uvicorn>=0.23.0",  # ASGI Server
+    "rich>=13.0.0",  # 命令行美化
+    "click>=8.0.0",  # CLI 框架
+    "questionary>=2.0.0",  # 交互式选择
 ]
 
 [project.optional-dependencies]
@@ -39,5 +42,9 @@ build-backend = "pdm.backend"
 [tool.pdm.scripts]
 workflow = "python -m evolve_rfc.workflow"
 nightly = "python -m evolve_rfc.nightly.daemon"
+cli = "python -m evolve_rfc.cli"
 test = "pytest -v"
 format = "ruff format ."
+
+[project.scripts]
+evolverfc = "evolve_rfc.cli:main"
