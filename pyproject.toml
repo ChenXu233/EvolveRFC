@@ -43,6 +43,7 @@ build-backend = "pdm.backend"
 workflow = "python -m evolve_rfc.workflow"
 nightly = "python -m evolve_rfc.nightly.daemon"
 cli = "python -m evolve_rfc.cli"
+start = "python start.py"
 test = "pytest -v"
 format = "ruff format ."
 
