@@ -15,13 +15,20 @@ if TYPE_CHECKING:
     pass
 
 
-def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
+def _create_llm_client(
+    role_name: str, config: BaseLLMConfig
+) -> ChatOpenAI | ChatAnthropic:
     """根据配置创建 LLM 客户端"""
+
+    if not config.api_key:
+        raise ValueError(f"角色 {role_name} 的 LLM 配置缺少 API 密钥")
+
     if config.provider == "openai":
         return ChatOpenAI(
             model=config.model,
             temperature=config.temperature,
             base_url=config.base_url,
+            api_key=config.api_key,
         )
     elif config.provider == "anthropic":
         return ChatAnthropic(
@@ -30,6 +37,7 @@ def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
             base_url=config.base_url,
             timeout=config.timeout,
             stop=config.stop,
+            api_key=config.api_key,
         )
     else:
         raise ValueError(f"不支持的 provider: {config.provider}")
@@ -38,7 +46,7 @@ def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
 def _get_client_for_role(role: str) -> ChatOpenAI | ChatAnthropic:
     """获取角色对应的 LLM 客户端"""
     config = get_role_llm_config(role)
-    return _create_llm_client(config)
+    return _create_llm_client(role, config)
 
 
 def run_parallel_review(

@@ -21,13 +21,19 @@ from ..shared import run_parallel_review
 _llm_clients: dict[str, ChatOpenAI | ChatAnthropic] = {}
 
 
-def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
+def _create_llm_client(
+    role_name: str, config: BaseLLMConfig
+) -> ChatOpenAI | ChatAnthropic:
     """根据配置创建 LLM 客户端"""
+    if not config.api_key:
+        raise ValueError(f"角色 {role_name} 的 LLM 配置缺少 API 密钥")
+
     if config.provider == "openai":
         return ChatOpenAI(
             model=config.model,
             temperature=config.temperature,
             base_url=config.base_url,
+            api_key=config.api_key,
         )
     elif config.provider == "anthropic":
         return ChatAnthropic(
@@ -36,6 +42,7 @@ def _create_llm_client(config: BaseLLMConfig) -> ChatOpenAI | ChatAnthropic:
             base_url=config.base_url,
             timeout=config.timeout,
             stop=config.stop,
+            api_key=config.api_key,
         )
     else:
         raise ValueError(f"不支持的 provider: {config.provider}")
@@ -50,7 +57,7 @@ def get_llm_client(role_name: str | None = None) -> ChatOpenAI | ChatAnthropic:
             config = get_role_llm_config(role_name)
         else:
             config = get_role_llm_config("architect")  # 使用全局配置
-        _llm_clients[key] = _create_llm_client(config)
+        _llm_clients[key] = _create_llm_client(role_name or "architect", config)
 
     return _llm_clients[key]
 
@@ -166,7 +173,9 @@ def clerk_summary_node(state: DiscussionState) -> DiscussionState:
             SystemMessage(content=get_role_prompt("clerk")),
             HumanMessage(content=input_text),
         ])
-        content = response.content
+        response_content = response.content
+        # 确保 content 是字符串类型
+        content = str(response_content) if not isinstance(response_content, str) else response_content
 
         # 添加澄清事件
         clarification_event = DiscussionEvent(
