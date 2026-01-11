@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """启动 EvolveRFC 交互式面板"""
 import sys
-from evolve_rfc.cli.main import main
+from evolve_rfc.ui.textual_app import run_textual_app
 
 if __name__ == "__main__":
     try:
-        main()
+        run_textual_app()
     except KeyboardInterrupt:
         print("\n\n👋 用户取消，再见！")
         sys.exit(0)
