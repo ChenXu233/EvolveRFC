@@ -6,8 +6,29 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import TypedDict, Literal, Annotated, Optional
+from typing import TypedDict, Literal, Annotated, Optional, List
 from operator import add
+import uuid
+
+
+class ViewpointStatus(Enum):
+    """观点状态枚举"""
+    ACTIVE = "active"       # 活跃（待讨论）
+    RESOLVED = "resolved"   # 已解决
+    REJECTED = "rejected"   # 已拒绝
+
+
+@dataclass
+class Viewpoint:
+    """观点（不可变数据单元）"""
+    id: str                           # 唯一标识
+    content: str                      # 核心观点（一句话）
+    evidence: List[str]               # 论据列表
+    proposer: str                     # 提出者
+    status: ViewpointStatus           # 状态
+    vote_count: dict                  # 投票统计 {"赞成": n, "反对": n, "弃权": n}
+    created_round: int                # 创建轮次
+    resolved_round: Optional[int] = None  # 解决轮次
 
 
 class EventType(Enum):
@@ -64,6 +85,10 @@ class DiscussionState(TypedDict):
     consensus_points: Annotated[list, add]  # 已达成共识的条目列表
     open_issues: Annotated[list, add]       # 待决议项列表（含正反方论点）
 
+    # === 观点池机制 ===
+    viewpoint_pool: Annotated[list[Viewpoint], add]  # 活跃观点池（最多3个）
+    resolved_viewpoints: Annotated[list[Viewpoint], add]  # 已解决观点
+
     # === 流程控制 ===
     awaiting_human_input: bool             # 是否暂停等待人类输入
     human_decision: Optional[dict]         # 人类决策结果
@@ -82,6 +107,8 @@ def create_initial_state(rfc_content: str, max_rounds: int = 10) -> DiscussionSt
         current_focus="",
         consensus_points=[],
         open_issues=[],
+        viewpoint_pool=[],
+        resolved_viewpoints=[],
         awaiting_human_input=False,
         human_decision=None,
         last_human_action=None,
@@ -100,6 +127,8 @@ def add_event(state: DiscussionState, event: DiscussionEvent) -> DiscussionState
         current_focus=state["current_focus"],
         consensus_points=state["consensus_points"],
         open_issues=state["open_issues"],
+        viewpoint_pool=state["viewpoint_pool"],
+        resolved_viewpoints=state["resolved_viewpoints"],
         awaiting_human_input=state["awaiting_human_input"],
         human_decision=state["human_decision"],
         last_human_action=state["last_human_action"],
@@ -112,3 +141,144 @@ def add_event(state: DiscussionState, event: DiscussionEvent) -> DiscussionState
 def get_latest_events(state: DiscussionState, count: int = 10) -> list[DiscussionEvent]:
     """获取最近的N个事件"""
     return state["events"][-count:]
+
+
+# === 观点池管理函数 ===
+
+VIEWPOINT_POOL_LIMIT = 3  # 观点池上限
+
+
+def can_add_viewpoint(state: DiscussionState) -> bool:
+    """检查是否可以在观点池中添加新观点"""
+    return len(state["viewpoint_pool"]) < VIEWPOINT_POOL_LIMIT
+
+
+def create_viewpoint(
+    content: str,
+    evidence: List[str],
+    proposer: str,
+    created_round: int,
+) -> Viewpoint:
+    """创建新观点"""
+    return Viewpoint(
+        id=str(uuid.uuid4())[:8],
+        content=content,
+        evidence=evidence,
+        proposer=proposer,
+        status=ViewpointStatus.ACTIVE,
+        vote_count={"赞成": 0, "反对": 0, "弃权": 0},
+        created_round=created_round,
+        resolved_round=None,
+    )
+
+
+def add_viewpoint_to_pool(state: DiscussionState, viewpoint: Viewpoint) -> DiscussionState:
+    """将观点添加到观点池"""
+    if not can_add_viewpoint(state):
+        raise ValueError(f"观点池已满（最多{VIEWPOINT_POOL_LIMIT}个观点）")
+
+    return DiscussionState(
+        rfc_content=state["rfc_content"],
+        max_rounds=state["max_rounds"],
+        current_round=state["current_round"],
+        current_focus=state["current_focus"],
+        consensus_points=state["consensus_points"],
+        open_issues=state["open_issues"],
+        viewpoint_pool=state["viewpoint_pool"] + [viewpoint],
+        resolved_viewpoints=state["resolved_viewpoints"],
+        awaiting_human_input=state["awaiting_human_input"],
+        human_decision=state["human_decision"],
+        last_human_action=state["last_human_action"],
+        timeout_count=state["timeout_count"],
+        workflow_status=state["workflow_status"],
+        events=state["events"],
+    )
+
+
+def vote_viewpoint(viewpoint: Viewpoint, vote_result: dict) -> Viewpoint:
+    """为观点投票（返回新观点对象，不可变）"""
+    updated_count = viewpoint.vote_count.copy()
+    vote = vote_result.get("vote", "弃权")
+    if vote in updated_count:
+        updated_count[vote] += 1
+    return Viewpoint(
+        id=viewpoint.id,
+        content=viewpoint.content,
+        evidence=viewpoint.evidence,
+        proposer=viewpoint.proposer,
+        status=viewpoint.status,
+        vote_count=updated_count,
+        created_round=viewpoint.created_round,
+        resolved_round=viewpoint.resolved_round,
+    )
+
+
+def resolve_viewpoint(viewpoint: Viewpoint, resolved_round: int, status: ViewpointStatus = ViewpointStatus.RESOLVED) -> Viewpoint:
+    """标记观点为已解决（返回新观点对象，不可变）"""
+    return Viewpoint(
+        id=viewpoint.id,
+        content=viewpoint.content,
+        evidence=viewpoint.evidence,
+        proposer=viewpoint.proposer,
+        status=status,
+        vote_count=viewpoint.vote_count,
+        created_round=viewpoint.created_round,
+        resolved_round=resolved_round,
+    )
+
+
+def check_viewpoint_resolved(viewpoint: Viewpoint, total_reviewers: int) -> bool:
+    """检查观点是否已解决（多数赞成 = 解决）"""
+    if viewpoint.status != ViewpointStatus.ACTIVE:
+        return True
+
+    yes_votes = viewpoint.vote_count.get("赞成", 0)
+    no_votes = viewpoint.vote_count.get("反对", 0)
+
+    # 多数赞成且赞成票数 > 反对票数
+    return yes_votes > no_votes and yes_votes > total_reviewers // 2
+
+
+def resolve_active_viewpoints(state: DiscussionState, current_round: int) -> DiscussionState:
+    """检查并解决观点池中的已解决观点"""
+    reviewers_count = 4  # 默认4个评审者（architect, security, cost_control, innovator）
+    active_viewpoints = []
+    resolved_viewpoints = list(state["resolved_viewpoints"])
+
+    for vp in state["viewpoint_pool"]:
+        if check_viewpoint_resolved(vp, reviewers_count):
+            resolved_viewpoints.append(resolve_viewpoint(vp, current_round))
+        else:
+            active_viewpoints.append(vp)
+
+    return DiscussionState(
+        rfc_content=state["rfc_content"],
+        max_rounds=state["max_rounds"],
+        current_round=state["current_round"],
+        current_focus=state["current_focus"],
+        consensus_points=state["consensus_points"],
+        open_issues=state["open_issues"],
+        viewpoint_pool=active_viewpoints,
+        resolved_viewpoints=resolved_viewpoints,
+        awaiting_human_input=state["awaiting_human_input"],
+        human_decision=state["human_decision"],
+        last_human_action=state["last_human_action"],
+        timeout_count=state["timeout_count"],
+        workflow_status=state["workflow_status"],
+        events=state["events"],
+    )
+
+
+def format_viewpoint_pool(viewpoint_pool: list[Viewpoint]) -> str:
+    """格式化观点池为可读字符串"""
+    if not viewpoint_pool:
+        return "当前无活跃观点"
+
+    lines = []
+    for i, vp in enumerate(viewpoint_pool, 1):
+        status_icon = "🔴" if vp.status == ViewpointStatus.ACTIVE else "🟢"
+        votes = f"👍{vp.vote_count.get('赞成', 0)} 👎{vp.vote_count.get('反对', 0)}"
+        lines.append(f"{status_icon} 观点{i}: {vp.content}")
+        lines.append(f"   提出者: {vp.proposer} | 投票: {votes}")
+
+    return "\n".join(lines)
