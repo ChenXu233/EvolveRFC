@@ -1,6 +1,7 @@
 """工作流节点定义
 """
 
+from typing import Optional
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -15,6 +16,7 @@ from ..core.state import (
 from ..core.router import default_router
 from ..agents import get_role_prompt, get_reviewer_roles
 from ..shared import run_parallel_review
+from ..ui import start_ai_review_header, StreamingPanel
 
 
 # 全局 LLM 客户端缓存
@@ -68,15 +70,38 @@ def init_node(state: DiscussionState) -> DiscussionState:
 
 
 def parallel_review_node(state: DiscussionState) -> DiscussionState:
-    """并行评审节点 - 多个角色同时评审"""
+    """并行评审节点 - 多个角色顺序评审，每个角色实时显示输出"""
     rfc_content = state["rfc_content"]
     current_round = state["current_round"]
 
-    # 使用共享的并行评审逻辑
+    # 当前角色的流式面板
+    current_panel: Optional[StreamingPanel] = None
+
+    def stream_callback(role: str, chunk: str):
+        """流式输出回调 - 实时显示在 Panel 中"""
+        nonlocal current_panel
+        if current_panel is None or current_panel.role != role:
+            # 完成上一个 Panel
+            if current_panel is not None:
+                current_panel.finish()
+            # 创建新的流式面板
+            current_panel = StreamingPanel(role, current_round)
+            current_panel.start()
+        # 添加内容到当前面板
+        current_panel.add_content(chunk)
+
+    # 使用共享的并行评审逻辑（带流式回调）
     review_results = run_parallel_review(
         content=rfc_content,
         current_round=current_round,
+        stream_callback=stream_callback,
     )
+
+    # 完成最后的 Panel
+    if current_panel is not None:
+        # 获取投票结果
+        last_vote = review_results[-1].get("vote") if review_results else None
+        current_panel.finish(last_vote)
 
     # 创建评审事件
     new_events = []

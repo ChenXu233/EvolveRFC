@@ -9,8 +9,8 @@ from pathlib import Path
 # 兼容旧代码：RoleType = str
 RoleType = str
 
-# 提示词文件路径
-PROMPTS_DIR = Path(__file__).parent.parent.parent / "prompts"
+# 提示词文件路径 - 向上4级到项目根目录，再进入prompts
+PROMPTS_DIR = Path(__file__).parent.parent.parent.parent / "prompts"
 
 # 默认角色定义（回退用）
 DEFAULT_ROLES: list[dict] = [

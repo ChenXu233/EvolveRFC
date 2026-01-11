@@ -2,6 +2,7 @@
 
 支持键盘上下键、鼠标点击的交互式菜单。
 """
+import os
 import sys
 import time
 from pathlib import Path
@@ -11,11 +12,12 @@ from questionary import Style
 
 from evolve_rfc.ui import (
     show_logo,
-    show_ai_review,
     show_voting_table,
     show_consensus_progress,
     show_final_report,
     show_error,
+    StreamingPanel,
+    TokenMonitor,
 )
 from evolve_rfc.mcp.main import ensure_mcp_started
 from evolve_rfc.shared.debate import run_parallel_review, analyze_votes, check_approval
@@ -29,6 +31,11 @@ custom_style = Style([
     ("selected", "fg:#00ff00"),
     ("header", "fg:#00ffff bold"),
 ])
+
+
+def clear_terminal():
+    """清空终端屏幕，跨平台兼容"""
+    os.system('cls' if os.name == 'nt' else 'clear')
 
 
 def run_workflow():
@@ -55,6 +62,10 @@ def run_workflow():
 
     print(f"🚀 开始 RFC 评审 (最多 {max_rounds} 轮)\n")
 
+    # 启动 Token 监控器
+    token_monitor = TokenMonitor()
+    token_monitor.start()
+
     all_results = []
 
     for round_num in range(1, max_rounds + 1):
@@ -62,13 +73,35 @@ def run_workflow():
         print(f"📍 第 {round_num} 轮评审")
         print(f"{'=' * 60}\n")
 
+        # 流式输出变量
+        current_panel = None
+
+        def stream_callback(role: str, chunk: str):
+            nonlocal current_panel
+            if current_panel is None or current_panel.role != role:
+                if current_panel is not None:
+                    current_panel.finish()
+                current_panel = StreamingPanel(role, round_num)
+                current_panel.start()
+            current_panel.add_content(chunk)
+
+        def token_callback(token_data: dict):
+            """更新 token 监控"""
+            token_monitor.update(token_data)
+
         print("⏳ AI 角色正在评审...\n")
 
-        results = run_parallel_review(content=rfc_content, current_round=round_num)
+        results = run_parallel_review(
+            content=rfc_content,
+            current_round=round_num,
+            stream_callback=stream_callback,
+            token_callback=token_callback,
+        )
         all_results.extend(results)
 
-        for r in results:
-            show_ai_review(r["role"], r["content"], r.get("vote") or "弃权", round_num)
+        # 完成最后的 Panel
+        if current_panel is not None:
+            current_panel.finish(results[-1].get("vote") if results else None)
 
         vote_result = analyze_votes(results)
         show_voting_table(results, round_num)
@@ -83,12 +116,14 @@ def run_workflow():
         )
 
         if check_result["finished"]:
+            token_monitor.stop()
             show_final_report(results, vote_result, check_result["approved"])
             return
 
         print("⏳ 准备下一轮辩论...")
         time.sleep(1)
 
+    token_monitor.stop()
     vote_result = analyze_votes(all_results)
     show_final_report(all_results, vote_result, approved=False)
 
@@ -168,6 +203,7 @@ def main_menu():
 
 def main():
     """主入口"""
+    clear_terminal()
     show_logo()
     print()
     main_menu()
