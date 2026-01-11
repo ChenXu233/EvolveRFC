@@ -12,6 +12,8 @@ from .nodes import (
     viewpoint_pool_manager_node,
     human_oversight_node,
     clerk_summary_node,
+    clerk_rfc_modify_node,
+    rfc_vote_node,
     timeout_checker_node,
     final_report_node,
 )
@@ -21,7 +23,7 @@ from .edges import (
 
 
 def build_workflow_graph():
-    """构建评审工作流图（集成观点池机制）"""
+    """构建评审工作流图（集成观点池机制 + RFC修改投票）"""
     # 创建状态图
     graph = StateGraph(DiscussionState)
 
@@ -32,6 +34,8 @@ def build_workflow_graph():
     graph.add_node("viewpoint_pool_manager", viewpoint_pool_manager_node)
     graph.add_node("human_oversight", human_oversight_node)
     graph.add_node("clerk_summary", clerk_summary_node)
+    graph.add_node("clerk_rfc_modify", clerk_rfc_modify_node)
+    graph.add_node("rfc_vote", rfc_vote_node)
     graph.add_node("timeout_checker", timeout_checker_node)
     graph.add_node("final_report", final_report_node)
 
@@ -43,7 +47,27 @@ def build_workflow_graph():
     graph.add_edge("parallel_review", "vote_analyzer")
     graph.add_edge("viewpoint_pool_manager", "clerk_summary")
     graph.add_edge("timeout_checker", "clerk_summary")
-    graph.add_edge("clerk_summary", "parallel_review")
+    graph.add_edge("clerk_summary", "clerk_rfc_modify")
+    graph.add_edge("clerk_rfc_modify", "rfc_vote")
+
+    # 条件边 - RFC投票后
+    def route_after_rfc_vote(state: DiscussionState) -> str:
+        """RFC投票后路由"""
+        if state.get("rfc_final_vote_passed", False):
+            # RFC通过，进入总结
+            return "final_report"
+        else:
+            # RFC未通过，继续辩论
+            return "parallel_review"
+
+    graph.add_conditional_edges(
+        "rfc_vote",
+        route_after_rfc_vote,
+        {
+            "final_report": "final_report",
+            "parallel_review": "parallel_review",
+        },
+    )
 
     # 条件边 - 投票分析后（观点池管理）
     def route_after_vote_with_pool(state: DiscussionState) -> str:
@@ -106,7 +130,7 @@ def build_workflow_graph():
 
 
 def build_review_workflow(max_rounds: int = 10):
-    """构建评审工作流（带配置，集成观点池机制）"""
+    """构建评审工作流（带配置，集成观点池机制 + RFC修改投票）"""
     # 创建状态图
     graph = StateGraph(DiscussionState)
 
@@ -120,6 +144,8 @@ def build_review_workflow(max_rounds: int = 10):
     graph.add_node("viewpoint_pool_manager", viewpoint_pool_manager_node)
     graph.add_node("human_oversight", human_oversight_node)
     graph.add_node("clerk_summary", clerk_summary_node)
+    graph.add_node("clerk_rfc_modify", clerk_rfc_modify_node)
+    graph.add_node("rfc_vote", rfc_vote_node)
     graph.add_node("timeout_checker", timeout_checker_node)
     graph.add_node("final_report", final_report_node)
 
@@ -131,16 +157,32 @@ def build_review_workflow(max_rounds: int = 10):
     graph.add_edge("parallel_review", "vote_analyzer")
     graph.add_edge("viewpoint_pool_manager", "clerk_summary")
     graph.add_edge("timeout_checker", "clerk_summary")
-    graph.add_edge("clerk_summary", "parallel_review")
+    graph.add_edge("clerk_summary", "clerk_rfc_modify")
+    graph.add_edge("clerk_rfc_modify", "rfc_vote")
+
+    # 条件边 - RFC投票后
+    def route_after_rfc_vote(state: DiscussionState) -> str:
+        """RFC投票后路由"""
+        if state.get("rfc_final_vote_passed", False):
+            return "final_report"
+        else:
+            return "parallel_review"
+
+    graph.add_conditional_edges(
+        "rfc_vote",
+        route_after_rfc_vote,
+        {
+            "final_report": "final_report",
+            "parallel_review": "parallel_review",
+        },
+    )
 
     # 条件边 - 投票分析后（观点池管理）
     def route_after_vote_with_pool(state: DiscussionState) -> str:
         """投票分析后路由，包含观点池检查"""
-        # 如果观点池还有活跃观点，继续辩论
         if len(state.get("viewpoint_pool", [])) > 0:
             return "viewpoint_pool_manager"
 
-        # 观点池已空，检查是否需要人类介入
         needs_human = state.get("workflow_status") == "待人类决策"
         if needs_human:
             return "human_oversight"
@@ -163,10 +205,8 @@ def build_review_workflow(max_rounds: int = 10):
         """观点池管理后路由"""
         active_count = len(state.get("viewpoint_pool", []))
         if active_count > 0:
-            # 还有未解决的观点，继续辩论
             return "parallel_review"
         else:
-            # 所有观点已解决，进入总结
             return "clerk_summary"
 
     graph.add_conditional_edges(
@@ -180,9 +220,16 @@ def build_review_workflow(max_rounds: int = 10):
     )
 
     # 条件边 - 人类监督后
+    def route_after_human_oversight(state: DiscussionState) -> str:
+        """人类监督后路由"""
+        human_decision = state.get("human_decision") or {}
+        if human_decision.get("action") == "终止":
+            return "final_report"
+        return "parallel_review"
+
     graph.add_conditional_edges(
         "human_oversight",
-        lambda s: "final_report" if s.get("human_decision", {}).get("action") == "终止" else "parallel_review",
+        route_after_human_oversight,
         {
             "final_report": "final_report",
             "parallel_review": "parallel_review",

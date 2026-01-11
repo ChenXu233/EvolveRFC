@@ -93,17 +93,6 @@ class RFCApp(App):
         vote_text = vote or "待投票"
         self._rich_log.write(f"\n[bold green]✓ 结束[/] 投票: {vote_text}\n", scroll_end=True)
         
-        # 显示工具调用记录
-        if tool_calls:
-            self._rich_log.write("\n[bold yellow]🔧 工具调用记录:[/]", scroll_end=True)
-            for tc in tool_calls:
-                tool_name = tc.get("tool", "unknown")
-                args = tc.get("arguments", {})
-                result = tc.get("result", "")
-                args_str = str(args)[:100] if args else ""
-                result_str = str(result)[:100] if result else ""
-                self._rich_log.write(f"  • {tool_name}({args_str}) → {result_str}", scroll_end=True)
-        
         self._last_vote = vote_text
 
     def post_tokens(self, stats: TokenStats) -> None:

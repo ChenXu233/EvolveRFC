@@ -29,6 +29,9 @@ class Viewpoint:
     vote_count: dict                  # 投票统计 {"赞成": n, "反对": n, "弃权": n}
     created_round: int                # 创建轮次
     resolved_round: Optional[int] = None  # 解决轮次
+    solutions: List[str] = field(default_factory=list)  # 解决方案列表
+    arguments: List[dict] = field(default_factory=list)  # 论证/反驳列表
+    proposed_solution: Optional[str] = None  # 建议的解决方案
 
 
 class EventType(Enum):
@@ -79,6 +82,7 @@ class DiscussionState(TypedDict):
 
     # === 物化视图（从事件派生，可缓存）===
     rfc_content: str                      # 原始RFC内容
+    modified_rfc_content: Optional[str]   # 书记官根据通过的观点修改后的RFC
     max_rounds: int                       # 最大轮次（配置）
     current_round: int                    # 当前轮次
     current_focus: str                    # 当前轮次的争议焦点
@@ -94,7 +98,12 @@ class DiscussionState(TypedDict):
     human_decision: Optional[dict]         # 人类决策结果
     last_human_action: Optional[str]       # 上次人类操作类型
     timeout_count: int                     # 超时次数
-    workflow_status: Literal["讨论中", "待人类决策", "已完成", "已终止"]  # 工作流状态
+    workflow_status: Literal["讨论中", "待人类决策", "已完成", "已终止", "RFC已通过"]  # 工作流状态
+
+    # === RFC投票状态 ===
+    rfc_modification_applied: bool         # 是否应用了RFC修改
+    rfc_final_vote_results: Optional[list] # RFC最终投票结果
+    rfc_final_vote_passed: Optional[bool]  # RFC是否通过
 
 
 def create_initial_state(rfc_content: str, max_rounds: int = 10) -> DiscussionState:
@@ -102,6 +111,7 @@ def create_initial_state(rfc_content: str, max_rounds: int = 10) -> DiscussionSt
     return DiscussionState(
         events=[],
         rfc_content=rfc_content,
+        modified_rfc_content=None,
         max_rounds=max_rounds,
         current_round=1,
         current_focus="",
@@ -114,6 +124,9 @@ def create_initial_state(rfc_content: str, max_rounds: int = 10) -> DiscussionSt
         last_human_action=None,
         timeout_count=0,
         workflow_status="讨论中",
+        rfc_modification_applied=False,
+        rfc_final_vote_results=None,
+        rfc_final_vote_passed=None,
     )
 
 
@@ -122,6 +135,7 @@ def add_event(state: DiscussionState, event: DiscussionEvent) -> DiscussionState
     new_events = state["events"] + [event]
     return DiscussionState(
         rfc_content=state["rfc_content"],
+        modified_rfc_content=state.get("modified_rfc_content"),
         max_rounds=state["max_rounds"],
         current_round=state["current_round"],
         current_focus=state["current_focus"],
@@ -135,6 +149,9 @@ def add_event(state: DiscussionState, event: DiscussionEvent) -> DiscussionState
         timeout_count=state["timeout_count"],
         workflow_status=state["workflow_status"],
         events=new_events,
+        rfc_modification_applied=state.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state.get("rfc_final_vote_passed"),
     )
 
 
@@ -179,6 +196,7 @@ def add_viewpoint_to_pool(state: DiscussionState, viewpoint: Viewpoint) -> Discu
 
     return DiscussionState(
         rfc_content=state["rfc_content"],
+        modified_rfc_content=state.get("modified_rfc_content"),
         max_rounds=state["max_rounds"],
         current_round=state["current_round"],
         current_focus=state["current_focus"],
@@ -192,6 +210,9 @@ def add_viewpoint_to_pool(state: DiscussionState, viewpoint: Viewpoint) -> Discu
         timeout_count=state["timeout_count"],
         workflow_status=state["workflow_status"],
         events=state["events"],
+        rfc_modification_applied=state.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state.get("rfc_final_vote_passed"),
     )
 
 
@@ -201,6 +222,16 @@ def vote_viewpoint(viewpoint: Viewpoint, vote_result: dict) -> Viewpoint:
     vote = vote_result.get("vote", "弃权")
     if vote in updated_count:
         updated_count[vote] += 1
+    
+    # 添加论证记录
+    new_arguments = list(viewpoint.arguments)
+    new_arguments.append({
+        "actor": vote_result.get("actor", "unknown"),
+        "content": vote_result.get("content", ""),
+        "stance": vote,
+        "round": vote_result.get("round", viewpoint.created_round),
+    })
+    
     return Viewpoint(
         id=viewpoint.id,
         content=viewpoint.content,
@@ -210,11 +241,17 @@ def vote_viewpoint(viewpoint: Viewpoint, vote_result: dict) -> Viewpoint:
         vote_count=updated_count,
         created_round=viewpoint.created_round,
         resolved_round=viewpoint.resolved_round,
+        solutions=viewpoint.solutions,
+        arguments=new_arguments,
     )
 
 
-def resolve_viewpoint(viewpoint: Viewpoint, resolved_round: int, status: ViewpointStatus = ViewpointStatus.RESOLVED) -> Viewpoint:
+def resolve_viewpoint(viewpoint: Viewpoint, resolved_round: int, status: ViewpointStatus = ViewpointStatus.RESOLVED, solution: Optional[str] = None) -> Viewpoint:
     """标记观点为已解决（返回新观点对象，不可变）"""
+    updated_solutions = list(viewpoint.solutions)
+    if solution:
+        updated_solutions.append(solution)
+    
     return Viewpoint(
         id=viewpoint.id,
         content=viewpoint.content,
@@ -224,6 +261,8 @@ def resolve_viewpoint(viewpoint: Viewpoint, resolved_round: int, status: Viewpoi
         vote_count=viewpoint.vote_count,
         created_round=viewpoint.created_round,
         resolved_round=resolved_round,
+        solutions=updated_solutions,
+        arguments=viewpoint.arguments,
     )
 
 
@@ -253,6 +292,7 @@ def resolve_active_viewpoints(state: DiscussionState, current_round: int) -> Dis
 
     return DiscussionState(
         rfc_content=state["rfc_content"],
+        modified_rfc_content=state.get("modified_rfc_content"),
         max_rounds=state["max_rounds"],
         current_round=state["current_round"],
         current_focus=state["current_focus"],
@@ -266,6 +306,9 @@ def resolve_active_viewpoints(state: DiscussionState, current_round: int) -> Dis
         timeout_count=state["timeout_count"],
         workflow_status=state["workflow_status"],
         events=state["events"],
+        rfc_modification_applied=state.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state.get("rfc_final_vote_passed"),
     )
 
 
@@ -280,5 +323,23 @@ def format_viewpoint_pool(viewpoint_pool: list[Viewpoint]) -> str:
         votes = f"👍{vp.vote_count.get('赞成', 0)} 👎{vp.vote_count.get('反对', 0)}"
         lines.append(f"{status_icon} 观点{i}: {vp.content}")
         lines.append(f"   提出者: {vp.proposer} | 投票: {votes}")
+        
+        # 显示论据
+        if vp.evidence:
+            evidence_str = "; ".join(vp.evidence[:2])
+            lines.append(f"   论据: {evidence_str}")
+        
+        # 显示论证/反驳
+        if vp.arguments:
+            lines.append("   论证:")
+            for arg in vp.arguments[-3:]:  # 只显示最近3条
+                stance_icon = "👍" if arg.get("stance") == "赞成" else "👎" if arg.get("stance") == "反对" else "🤔"
+                lines.append(f"     {stance_icon} {arg.get('actor', '?')}: {arg.get('content', '')[:50]}...")
+        
+        # 显示解决方案
+        if vp.solutions:
+            lines.append("   解决方案:")
+            for sol in vp.solutions:
+                lines.append(f"     ✓ {sol[:50]}...")
 
     return "\n".join(lines)

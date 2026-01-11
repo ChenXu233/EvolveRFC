@@ -6,8 +6,7 @@
 from pathlib import Path
 import re
 import json
-from typing import List, Optional, Dict, Any
-from contextvars import ContextVar
+from typing import List, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 
 from langchain_core.tools import tool
@@ -24,47 +23,79 @@ class ToolCallRecord:
     timestamp: float = field(default_factory=lambda: __import__("time").time())
 
 
-# === 上下文变量用于工具间共享数据 ===
-_viewpoints_from_tool: ContextVar[Optional[List[dict]]] = ContextVar(
-    "viewpoints_from_tool", default=None
-)
+# === 全局变量用于工具间共享数据（单线程顺序执行，直接用全局变量） ===
+_viewpoints_from_tool: List[dict] = []
 
-_tool_call_history: ContextVar[Optional[List[ToolCallRecord]]] = ContextVar(
-    "tool_call_history", default=None
-)
+_tool_call_history: List[ToolCallRecord] = []
+
+_viewpoint_pool_for_tool: List = []
+
+_tool_invoke_callback: Optional[Callable[[str, Dict, str], None]] = None
+
+
+def set_tool_invoke_callback(callback: Optional[Callable[[str, Dict, str], None]]):
+    """设置工具调用回调，用于实时显示工具调用"""
+    global _tool_invoke_callback
+    _tool_invoke_callback = callback
+
+
+def notify_tool_invoke(tool_name: str, arguments: Dict[str, Any], result: str = ""):
+    """通知工具被调用（用于实时显示）"""
+    global _tool_invoke_callback
+    if _tool_invoke_callback:
+        try:
+            _tool_invoke_callback(tool_name, arguments, result)
+        except Exception:
+            pass
 
 
 def get_viewpoints_from_tool() -> List[dict]:
     """获取通过工具调用添加的观点"""
-    result = _viewpoints_from_tool.get()
-    return result if result is not None else []
+    return _viewpoints_from_tool
 
 
 def clear_viewpoints_from_tool():
-    """清空通过工具调用添加的观点"""
-    _viewpoints_from_tool.set(None)
+    """不清空观点，让观点积累供其他AI看到"""
+    pass
 
 
 def get_tool_call_history() -> List[ToolCallRecord]:
     """获取工具调用历史"""
-    result = _tool_call_history.get()
-    return result if result is not None else []
+    return _tool_call_history
 
 
 def clear_tool_call_history():
     """清空工具调用历史"""
-    _tool_call_history.set(None)
+    global _tool_call_history
+    _tool_call_history = []
 
 
 def record_tool_call(tool_name: str, arguments: Dict[str, Any], result: str = ""):
     """记录工具调用"""
-    history = get_tool_call_history()
-    history.append(ToolCallRecord(
+    global _tool_call_history
+    _tool_call_history.append(ToolCallRecord(
         tool_name=tool_name,
         arguments=arguments,
         result=result,
     ))
-    _tool_call_history.set(history)
+
+
+# === 观点池上下文管理 ===
+def set_viewpoint_pool_for_tool(pool: list):
+    """设置当前观点池，供工具读取"""
+    global _viewpoint_pool_for_tool
+    _viewpoint_pool_for_tool = pool
+
+
+def get_viewpoint_pool_for_tool() -> list:
+    """获取工具视角的观点池"""
+    return _viewpoint_pool_for_tool
+
+
+def clear_viewpoint_pool_for_tool():
+    """清空工具视角的观点池"""
+    global _viewpoint_pool_for_tool
+    _viewpoint_pool_for_tool = []
 
 
 # === 使用 @tool 装饰器定义工具 ===
@@ -213,6 +244,55 @@ def code_search(pattern: str, file_pattern: str = "*.py", max_count: int = 20, *
 
 
 @tool
+def get_viewpoint_pool(**kwargs) -> str:
+    """查看当前观点池的状态，包括所有活跃观点、投票情况和历史回应。
+
+    返回当前观点池的完整信息，用于了解还有哪些观点需要回应。
+    """
+    # 忽略未知参数
+    if kwargs:
+        pass
+
+    from ..core.state import ViewpointStatus
+
+    pool = _viewpoint_pool_for_tool
+    if not pool:
+        return "观点池为空，没有活跃观点。你可以提出新观点。"
+
+    result = ["=== 当前观点池 ==="]
+    result.append(f"共 {len(pool)} 个活跃观点（最多3个）\n")
+
+    for i, vp in enumerate(pool, 1):
+        status_icon = "🔴" if vp.status == ViewpointStatus.ACTIVE else "🟢"
+        votes = vp.vote_count
+        votes_str = f"👍{votes.get('赞成', 0)} 👎{votes.get('反对', 0)} 🤔{votes.get('弃权', 0)}"
+
+        result.append(f"{status_icon} 观点 {i} [{vp.id}]")
+        result.append(f"   内容: {vp.content}")
+        result.append(f"   提出者: {vp.proposer} | 投票: {votes_str}")
+
+        # 显示论据
+        if vp.evidence:
+            result.append(f"   论据: {'; '.join(vp.evidence[:2])}")
+
+        # 显示回应历史
+        if vp.arguments:
+            result.append(f"   已有 {len(vp.arguments)} 条回应:")
+            for arg in vp.arguments[-3:]:  # 最近3条
+                stance_icon = "👍" if arg.get("stance") == "赞成" else "👎" if arg.get("stance") == "反对" else "🤔"
+                result.append(f"     {stance_icon} {arg.get('actor', '?')}: {arg.get('content', '')[:80]}")
+
+        result.append("")  # 空行
+
+    result.append("=== 操作提示 ===")
+    result.append("- 必须先回应所有观点，才能提出新观点")
+    result.append("- 每个观点需要至少2票赞成且赞成>反对才能解决")
+    result.append("- 每人每轮最多提出1个新观点")
+
+    return "\n".join(result)
+
+
+@tool
 def list_dir(dir_path: str = ".", pattern: str = "*", max_count: int = 50, **kwargs) -> str:
     """列出目录下的文件和子目录
 
@@ -275,8 +355,10 @@ def propose_viewpoint(
 ) -> str:
     """提出一个新观点到观点池。
 
-    使用此工具当你发现了一个值得讨论的新问题或设计方案时。
-    观点池最多容纳3个活跃观点，只有当观点被多数人赞成（投票解决）后，才能提出新观点。
+    规则：
+    - 每人每轮最多提出1个新观点
+    - 观点池最多3个活跃观点
+    - 必须先回应现有观点，才能提出新观点
 
     Args:
         content: 观点内容（一句话概括核心问题）
@@ -295,7 +377,8 @@ def propose_viewpoint(
         return "错误: content 内容太短，请提供更详细的问题描述"
 
     # 检查是否超过限制
-    current = _viewpoints_from_tool.get() or []
+    global _viewpoints_from_tool
+    current = _viewpoints_from_tool
     if len(current) >= 3:
         return "观点池已满（最多3个观点），不能提出新观点。请先回应现有观点，或等待观点被解决。"
 
@@ -313,7 +396,7 @@ def propose_viewpoint(
         "stance": stance,
     }
 
-    _viewpoints_from_tool.set(current + [viewpoint])
+    _viewpoints_from_tool = current + [viewpoint]
 
     # 记录工具调用
     record_tool_call("propose_viewpoint", {
@@ -321,6 +404,13 @@ def propose_viewpoint(
         "evidence": evidence,
         "stance": stance,
     }, f"观点已添加到观点池：{content[:50]}...")
+
+    # 实时通知工具调用
+    notify_tool_invoke("propose_viewpoint", {
+        "content": content,
+        "evidence": evidence,
+        "stance": stance,
+    }, f"观点已添加：{content[:50]}...")
 
     return f"观点已添加到观点池：{content[:50]}...（当前池中 {len(current) + 1}/3 个观点）"
 
@@ -375,6 +465,13 @@ def respond_to_viewpoint(
         "stance": stance,
     }, json.dumps(response_data, ensure_ascii=False))
 
+    # 实时通知工具调用
+    notify_tool_invoke("respond_to_viewpoint", {
+        "viewpoint_id": viewpoint_id,
+        "response": response,
+        "stance": stance,
+    }, f"回应观点 {viewpoint_id}: {stance}")
+
     return json.dumps(response_data, ensure_ascii=False)
 
 
@@ -387,6 +484,7 @@ def get_all_tools() -> list:
         file_search,
         code_search,
         list_dir,
+        get_viewpoint_pool,
         propose_viewpoint,
         respond_to_viewpoint,
     ]
@@ -401,8 +499,9 @@ def get_tool_names() -> list[str]:
 
 def cleanup_tool_context():
     """清理工具调用上下文（防止数据残留）
-    
+
     在每次工具调用会话开始前调用，确保上下文干净。
     """
     clear_viewpoints_from_tool()
     clear_tool_call_history()
+    clear_viewpoint_pool_for_tool()

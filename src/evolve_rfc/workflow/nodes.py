@@ -1,6 +1,9 @@
 """工作流节点定义
 """
 
+import json
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, Callable
 from contextvars import ContextVar
 from langchain_openai import ChatOpenAI
@@ -18,10 +21,9 @@ from ..core.state import (
     resolve_active_viewpoints,
     VIEWPOINT_POOL_LIMIT,
 )
-from ..core.router import default_router
 from ..agents import get_role_prompt, get_reviewer_roles
 from ..shared import run_review_with_viewpoint_pool, run_review_with_tools
-from ..shared.tools import cleanup_tool_context
+from ..shared.tools import cleanup_tool_context, set_viewpoint_pool_for_tool
 
 
 # 全局 LLM 客户端缓存
@@ -145,16 +147,19 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
 
     # 使用带观点池的评审逻辑
     review_results = []
-    
+
     # 在开始评审前清理工具上下文（防止数据残留）
     cleanup_tool_context()
-    
+
     for role in get_reviewer_roles():
         # 通知 UI 评审开始
         _on_review_start(role, current_round)
-        
+
         # 在每个角色评审开始前清理工具上下文
         cleanup_tool_context()
+
+        # 设置观点池上下文，让工具可以读取当前观点池
+        set_viewpoint_pool_for_tool(list(viewpoint_pool))
 
         # 创建流式回调包装器
         def make_callback(rl: str) -> Callable[[str], None]:
@@ -178,6 +183,10 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
             # 根据配置选择评审函数
             if ENABLE_MULTI_STEP_THINKING:
                 # 使用多段思考评审（ReAct Agent，支持工具调用）
+                # 创建停止检查回调：实时检查停止标志
+                def stop_check() -> bool:
+                    return not _review_running_var.get()
+                
                 result = run_review_with_tools(
                     role=role,
                     content=rfc_content,
@@ -186,9 +195,14 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
                     stream_callback=role_callback,
                     previous_results=review_results,
                     token_callback=role_token_callback,
+                    stop_check_callback=stop_check,  # 实时停止检查
                 )
             else:
                 # 使用普通评审（单次 LLM 调用）
+                # 创建停止检查回调
+                def stop_check() -> bool:
+                    return not _review_running_var.get()
+                
                 result = run_review_with_viewpoint_pool(
                     role=role,
                     content=rfc_content,
@@ -197,6 +211,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
                     stream_callback=role_callback,
                     previous_results=review_results,
                     token_callback=role_token_callback,
+                    stop_check_callback=stop_check,  # 实时停止检查
                 )
             review_results.append(result)
         except Exception as e:
@@ -215,7 +230,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
         # 调用 finish 回调，显示工具调用信息
         if external_finish_cb:
             external_finish_cb(role, last_tool_calls)
-        
+
         # 实时停止检查：每个角色评审完成后立即检查停止信号
         if not _review_running_var.get():
             _log_message(f"⏹ 评审在角色 {role} 完成后停止")
@@ -228,48 +243,118 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
             return state
 
     # 收集所有新事件
-    new_events = [
-        DiscussionEvent(
+    new_events = []
+    for result in review_results:
+        role = result.get("role", "未知")
+        vote = result.get("vote")
+        
+        # 生成评审事件
+        new_events.append(DiscussionEvent(
             event_type=EventType.ROLE_REVIEW,
-            actor=result["role"],
-            content=result["content"],
+            actor=role,
+            content=result.get("content", ""),
             metadata={"round": current_round},
-        )
-        for result in review_results
-    ]
+            vote_result=vote,  # 包含投票结果
+        ))
 
-    # 收集所有新观点（限制数量）
+    # 收集所有新观点（限制：每人每轮1个，总量不超过池上限）
     new_viewpoints = []
     current_pool_size = len(state["viewpoint_pool"])
+    role_viewpoint_count: dict[str, int] = {}  # 记录每个角色本轮已提出观点数
+
     for result in review_results:
+        role = result.get("role", "未知")
+
+        # 该角色本轮已提出过观点，跳过
+        if role_viewpoint_count.get(role, 0) >= 1:
+            continue
+
+        # 观点池已满，跳过
         if current_pool_size + len(new_viewpoints) >= VIEWPOINT_POOL_LIMIT:
-            break  # 观点池已满
-        for vp_data in result.get("new_viewpoints", []):
-            if current_pool_size + len(new_viewpoints) >= VIEWPOINT_POOL_LIMIT:
-                break
-            new_viewpoints.append(create_viewpoint(
-                content=vp_data.get("content", ""),
-                evidence=vp_data.get("evidence", []),
-                proposer=result["role"],
-                created_round=current_round,
-            ))
+            break
+
+        # 只取该角色的第一个观点
+        vp_data_list = result.get("new_viewpoints", [])
+        if not vp_data_list:
+            continue
+
+        # 只取第一个观点
+        vp_data = vp_data_list[0]
+        new_viewpoints.append(create_viewpoint(
+            content=vp_data.get("content", ""),
+            evidence=vp_data.get("evidence", []),
+            proposer=role,
+            created_round=current_round,
+        ))
+        role_viewpoint_count[role] = 1
+
+    # 同步观点回应到观点池（更新 arguments）
+    updated_pool = list(state["viewpoint_pool"])  # 复制当前观点池
+    for result in review_results:
+        role = result.get("role", "未知")
+        tool_calls = result.get("tool_calls", [])
+
+        for tc in tool_calls:
+            if tc.get("tool") == "respond_to_viewpoint":
+                args = tc.get("arguments", {})
+                vp_id = args.get("viewpoint_id", "")
+                stance = args.get("stance", "")
+                response = args.get("response", "")
+
+                # 找到对应的观点并更新
+                for i, vp in enumerate(updated_pool):
+                    if vp.id == vp_id:
+                        # 添加论证记录
+                        new_arguments = list(vp.arguments)
+                        new_arguments.append({
+                            "actor": role,
+                            "content": response,
+                            "stance": stance,
+                            "round": current_round,
+                        })
+
+                        # 更新投票统计
+                        new_vote_count = vp.vote_count.copy()
+                        if stance in new_vote_count:
+                            new_vote_count[stance] += 1
+
+                        # 创建更新后的观点
+                        from ..core.state import Viewpoint as VPClass
+                        updated_vp = VPClass(
+                            id=vp.id,
+                            content=vp.content,
+                            evidence=vp.evidence,
+                            proposer=vp.proposer,
+                            status=vp.status,
+                            vote_count=new_vote_count,
+                            created_round=vp.created_round,
+                            resolved_round=vp.resolved_round,
+                            solutions=vp.solutions,
+                            arguments=new_arguments,
+                        )
+                        updated_pool[i] = updated_vp
+                        break  # 找到一个就停止
 
     # 构建最终状态（只返回一次状态更新）
     result_state = DiscussionState(
-        rfc_content=state["rfc_content"],  # 保持不变
+        events=state["events"] + new_events,
+        rfc_content=state["rfc_content"],
+        modified_rfc_content=state.get("modified_rfc_content"),
         max_rounds=state["max_rounds"],
         current_round=state["current_round"],
         current_focus=state["current_focus"],
         consensus_points=state["consensus_points"],
         open_issues=state["open_issues"],
-        viewpoint_pool=state["viewpoint_pool"] + new_viewpoints,
+        viewpoint_pool=updated_pool + new_viewpoints,
         resolved_viewpoints=state["resolved_viewpoints"],
         awaiting_human_input=state["awaiting_human_input"],
         human_decision=state["human_decision"],
         last_human_action=state["last_human_action"],
         timeout_count=state["timeout_count"],
         workflow_status=state["workflow_status"],
-        events=state["events"] + new_events,
+        rfc_modification_applied=state.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state.get("rfc_final_vote_passed"),
     )
 
     return result_state
@@ -281,7 +366,9 @@ def add_viewpoint_to_pool(state: DiscussionState, viewpoint: Viewpoint) -> Discu
         return state  # 观点池已满，不添加
 
     return DiscussionState(
+        events=state["events"],
         rfc_content=state["rfc_content"],
+        modified_rfc_content=state.get("modified_rfc_content"),
         max_rounds=state["max_rounds"],
         current_round=state["current_round"],
         current_focus=state["current_focus"],
@@ -294,7 +381,9 @@ def add_viewpoint_to_pool(state: DiscussionState, viewpoint: Viewpoint) -> Discu
         last_human_action=state["last_human_action"],
         timeout_count=state["timeout_count"],
         workflow_status=state["workflow_status"],
-        events=state["events"],
+        rfc_modification_applied=state.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state.get("rfc_final_vote_passed"),
     )
 
 
@@ -303,22 +392,25 @@ def vote_analyzer_node(state: DiscussionState) -> DiscussionState:
     events = state["events"]
     current_round = state["current_round"]
 
-    # 收集本轮投票
-    vote_events = [
+    # 收集本轮评审事件（包含投票结果）
+    review_events = [
         e for e in events
-        if e.event_type == EventType.VOTE and e.metadata.get("round") == current_round
+        if e.event_type == EventType.ROLE_REVIEW 
+        and e.metadata.get("round") == current_round
+        and e.vote_result  # 只收集有投票结果的事件
     ]
 
     # 计算投票分布
-    if vote_events:
-        vote_results = [e.vote_result for e in vote_events if e.vote_result]
+    if review_events:
+        vote_results = [e.vote_result for e in review_events if e.vote_result]
         if vote_results:
             yes_votes = vote_results.count("赞成")
             no_votes = vote_results.count("反对")
             abstain_votes = vote_results.count("弃权")
 
-            # 检查是否需要人类介入
-            needs_human = default_router.should_human_intervene(state)
+            # 检查是否需要人类介入（反对票 > 30%）
+            total_votes = len(vote_results)
+            needs_human = (no_votes / total_votes) > 0.3 if total_votes > 0 else False
 
             # 添加投票统计事件
             stats_event = DiscussionEvent(
@@ -464,17 +556,210 @@ def final_report_node(state: DiscussionState) -> DiscussionState:
     return state
 
 
+def clerk_rfc_modify_node(state: DiscussionState) -> DiscussionState:
+    """书记官RFC修改节点 - 根据已通过的观点修改RFC原文
+
+    规则：观点获得2票赞成且赞成>反对时视为通过，书记官据此修改RFC
+    """
+    client = get_llm_client("clerk")
+    current_round = state["current_round"]
+    original_rfc = state["rfc_content"]
+    resolved_viewpoints = state.get("resolved_viewpoints", [])
+
+    # 检查本轮是否有新解决的观点
+    new_resolved = [vp for vp in resolved_viewpoints
+                    if vp.resolved_round == current_round]
+
+    if not new_resolved:
+        # 没有新解决的观点，无需修改RFC
+        state["modified_rfc_content"] = original_rfc
+        state["rfc_modification_applied"] = False
+
+        no_mod_event = DiscussionEvent(
+            event_type=EventType.CLARIFICATION,
+            actor="clerk",
+            content=f"第{current_round}轮无新通过观点，RFC保持不变",
+            metadata={"round": current_round, "modification": "none"},
+        )
+        state = add_event(state, no_mod_event)
+        return state
+
+    # 构建修改提示
+    input_text = f"""你是RFC评审的书记官。根据本轮通过的{len(new_resolved)}个观点，请修改RFC原文。
+
+## 原始RFC：
+{original_rfc[:3000]}...
+
+## 本轮通过的观点及解决方案：
+"""
+
+    for i, vp in enumerate(new_resolved, 1):
+        input_text += f"""
+{i}. 观点：{vp.content}
+   证据：{vp.evidence}
+   建议方案：{vp.proposed_solution}
+"""
+
+    input_text += """
+## 任务要求：
+1. 根据通过的观点击RFC原文进行最小必要修改
+2. 只修改与观点相关的内容，不要过度修改
+3. 保持RFC的整体结构和格式
+4. 输出修改后的完整RFC内容
+
+请输出修改后的完整RFC："""
+
+    try:
+        response = client.invoke([
+            SystemMessage(content=get_role_prompt("clerk")),
+            HumanMessage(content=input_text),
+        ])
+        response_content = response.content
+        modified_rfc = str(response_content) if not isinstance(response_content, str) else response_content
+
+        # 更新状态
+        state["modified_rfc_content"] = modified_rfc
+        state["rfc_modification_applied"] = True
+
+        # 添加修改事件
+        mod_event = DiscussionEvent(
+            event_type=EventType.CLARIFICATION,
+            actor="clerk",
+            content=f"第{current_round}轮RFC已根据{len(new_resolved)}个通过观点修改",
+            metadata={
+                "round": current_round,
+                "modification": "applied",
+                "resolved_viewpoints": [vp.id for vp in new_resolved],
+                "diff_summary": f"应用了{len(new_resolved)}个观点的修改建议"
+            },
+        )
+        state = add_event(state, mod_event)
+
+    except Exception as e:
+        # 修改失败，保持原RFC
+        state["modified_rfc_content"] = original_rfc
+        state["rfc_modification_applied"] = False
+
+        error_event = DiscussionEvent(
+            event_type=EventType.CLARIFICATION,
+            actor="clerk",
+            content=f"RFC修改失败，保持原文：{str(e)}",
+            metadata={"round": current_round, "modification": "failed"},
+        )
+        state = add_event(state, error_event)
+
+    return state
+
+
+def rfc_vote_node(state: DiscussionState) -> DiscussionState:
+    """RFC投票节点 - 各模型对修改后的RFC进行通过/不通过投票
+
+    这是针对RFC整体是否通过的投票，不是针对具体观点的投票。
+    """
+    current_round = state["current_round"]
+    modified_rfc = state.get("modified_rfc_content", state["rfc_content"])
+
+    # 收集各角色的投票
+    vote_results: list[dict] = []
+    roles = get_all_reviewer_roles()
+
+    # 构建投票提示
+    rfc_for_vote = modified_rfc if modified_rfc else state["rfc_content"]
+    vote_prompt = f"""请对修改后的RFC进行最终投票表决。
+
+## 修改后的RFC内容：
+{rfc_for_vote[:4000]}...
+
+## 评审历史：
+- 已通过观点数：{len(state.get('resolved_viewpoints', []))}
+- 当前轮次：{current_round}
+- 活跃观点数：{len(state.get('viewpoint_pool', []))}
+
+## 投票要求：
+请对整体RFC是否通过给出明确立场：
+- **赞成**：RFC经过修改后符合要求，可以接受
+- **反对**：RFC仍存在重大问题，需要继续修改
+- **弃权**：不确定，需要更多信息
+
+请只输出一个词：赞成、反对 或 弃权"""
+
+    for role in roles:
+        try:
+            client = get_llm_client(role)
+            response = client.invoke([
+                SystemMessage(content=get_role_prompt(role)),
+                HumanMessage(content=f"你正在参与RFC最终投票。\n\n{vote_prompt}"),
+            ])
+            response_content = response.content
+            vote_text = str(response_content).strip()
+
+            # 解析投票
+            if "赞成" in vote_text and "反对" not in vote_text:
+                vote = "赞成"
+            elif "反对" in vote_text:
+                vote = "反对"
+            else:
+                vote = "弃权"
+
+            vote_result = {
+                "voter": role,
+                "issue_id": "RFC_FINAL_VOTE",
+                "vote": vote,
+                "reason": vote_text[:200],
+            }
+            vote_results.append(vote_result)
+
+        except Exception as e:
+            # 投票失败默认为弃权
+            vote_result = {
+                "voter": role,
+                "issue_id": "RFC_FINAL_VOTE",
+                "vote": "弃权",
+                "reason": f"投票失败：{str(e)}",
+            }
+            vote_results.append(vote_result)
+
+    # 统计投票
+    yes_votes = sum(1 for r in vote_results if r["vote"] == "赞成")
+    no_votes = sum(1 for r in vote_results if r["vote"] == "反对")
+    abstain_votes = sum(1 for r in vote_results if r["vote"] == "弃权")
+
+    # 判断是否通过（简单多数赞成）
+    rfc_passed = yes_votes > no_votes
+
+    # 添加投票事件
+    vote_event = DiscussionEvent(
+        event_type=EventType.VOTE,
+        actor="system",
+        content=f"RFC最终投票结果：赞成{yes_votes}，反对{no_votes}，弃权{abstain_votes} - {'通过' if rfc_passed else '未通过'}",
+        metadata={
+            "round": current_round,
+            "vote_summary": {"赞成": yes_votes, "反对": no_votes, "弃权": abstain_votes},
+            "rfc_passed": rfc_passed,
+            "vote_results": vote_results,
+        },
+        vote_result="赞成" if rfc_passed else "反对",
+    )
+    state = add_event(state, vote_event)
+
+    # 更新状态
+    state["rfc_final_vote_results"] = vote_results
+    state["rfc_final_vote_passed"] = rfc_passed
+
+    if rfc_passed:
+        state["workflow_status"] = "RFC已通过"
+    else:
+        state["workflow_status"] = "讨论中"
+
+    return state
+
+
 def get_all_reviewer_roles() -> list[str]:
     """获取所有评审者角色（从配置动态读取）"""
     return get_reviewer_roles()
 
 
 # === 状态保存/加载功能 ===
-
-import json
-import os
-from datetime import datetime
-from pathlib import Path
 
 # 保存状态文件路径
 WORKFLOW_STATE_DIR = Path("workflow_states")
@@ -489,8 +774,7 @@ def serialize_datetime(obj):
 
 def serialize_state(state: DiscussionState, reason: str = "manual") -> dict:
     """将状态序列化为可保存的字典"""
-    from ..core.state import ViewpointStatus
-    
+
     # 序列化事件
     events_data = []
     for event in state.get("events", []):
@@ -521,6 +805,8 @@ def serialize_state(state: DiscussionState, reason: str = "manual") -> dict:
             "vote_count": vp.vote_count,
             "created_round": vp.created_round,
             "resolved_round": vp.resolved_round,
+            "solutions": vp.solutions,
+            "arguments": vp.arguments,
         })
     
     # 序列化已解决观点
@@ -535,6 +821,8 @@ def serialize_state(state: DiscussionState, reason: str = "manual") -> dict:
             "vote_count": vp.vote_count,
             "created_round": vp.created_round,
             "resolved_round": vp.resolved_round,
+            "solutions": vp.solutions,
+            "arguments": vp.arguments,
         })
     
     return {
@@ -543,6 +831,7 @@ def serialize_state(state: DiscussionState, reason: str = "manual") -> dict:
         "save_reason": reason,
         "state": {
             "rfc_content": state.get("rfc_content", ""),
+            "modified_rfc_content": state.get("modified_rfc_content"),
             "max_rounds": state.get("max_rounds", 10),
             "current_round": state.get("current_round", 1),
             "current_focus": state.get("current_focus", ""),
@@ -619,6 +908,8 @@ def deserialize_state(data: dict) -> DiscussionState:
             vote_count=vp_dict.get("vote_count", {"赞成": 0, "反对": 0, "弃权": 0}),
             created_round=vp_dict.get("created_round", 1),
             resolved_round=vp_dict.get("resolved_round", None),
+            solutions=vp_dict.get("solutions", []),
+            arguments=vp_dict.get("arguments", []),
         )
         viewpoint_pool.append(vp)
     
@@ -643,12 +934,15 @@ def deserialize_state(data: dict) -> DiscussionState:
             vote_count=vp_dict.get("vote_count", {"赞成": 0, "反对": 0, "弃权": 0}),
             created_round=vp_dict.get("created_round", 1),
             resolved_round=vp_dict.get("resolved_round", None),
+            solutions=vp_dict.get("solutions", []),
+            arguments=vp_dict.get("arguments", []),
         )
         resolved_viewpoints.append(vp)
-    
+
     return DiscussionState(
         events=events,
         rfc_content=state_data.get("rfc_content", ""),
+        modified_rfc_content=state_data.get("modified_rfc_content"),
         max_rounds=state_data.get("max_rounds", 10),
         current_round=state_data.get("current_round", 1),
         current_focus=state_data.get("current_focus", ""),
@@ -661,6 +955,9 @@ def deserialize_state(data: dict) -> DiscussionState:
         last_human_action=state_data.get("last_human_action", None),
         timeout_count=state_data.get("timeout_count", 0),
         workflow_status=state_data.get("workflow_status", "讨论中"),
+        rfc_modification_applied=state_data.get("rfc_modification_applied", False),
+        rfc_final_vote_results=state_data.get("rfc_final_vote_results"),
+        rfc_final_vote_passed=state_data.get("rfc_final_vote_passed"),
     )
 
 

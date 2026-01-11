@@ -4,6 +4,7 @@
 """
 
 from typing import Optional, Union, TYPE_CHECKING, Callable, Any, List
+import json
 from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -507,22 +508,34 @@ def build_viewpoint_pool_context(viewpoint_pool: List[Viewpoint]) -> str:
         用于 LLM 提示的上下文字符串
     """
     if not viewpoint_pool:
-        return "当前观点池为空，可以提出新的核心观点。"
+        return "=== 观点池 ===\n当前观点池为空。你可以提出1个新观点（必须用 propose_viewpoint 工具）。"
 
-    context_lines = ["=== 当前活跃观点池（最多3个，必须逐一回应）==="]
+    # 先列出所有活跃观点
+    active_viewpoints = [vp for vp in viewpoint_pool if vp.status == ViewpointStatus.ACTIVE]
 
-    for i, vp in enumerate(viewpoint_pool, 1):
-        status_icon = "🔴" if vp.status == ViewpointStatus.ACTIVE else "🟢"
-        votes_info = f"👍{vp.vote_count.get('赞成', 0)} 👎{vp.vote_count.get('反对', 0)}"
+    context_lines = ["=== 观点池 ==="]
 
-        context_lines.append(f"\n{status_icon} 观点{i} [{vp.id}]: {vp.content}")
-        context_lines.append(f"   提出者: {vp.proposer} | 投票: {votes_info}")
-        context_lines.append(f"   论据: {'; '.join(vp.evidence[:2])}")
+    if active_viewpoints:
+        context_lines.append(f"\n🔴 有 {len(active_viewpoints)} 个活跃观点待回应！")
+        context_lines.append("【必须先用 respond_to_viewpoint 回应每个观点，才能做其他事】\n")
 
-    context_lines.append("\n=== 讨论规则 ===")
-    context_lines.append("1. 你必须先回应观点池中的所有观点（每个观点至少一条意见）")
-    context_lines.append("2. 只能提出最多1个新观点（如果观点池未满）")
-    context_lines.append("3. 回应现有观点时，说明支持、反对或补充理由")
+        for i, vp in enumerate(active_viewpoints, 1):
+            votes_info = f"👍{vp.vote_count.get('赞成', 0)} 👎{vp.vote_count.get('反对', 0)}"
+            context_lines.append(f"{i}. [{vp.id}] {vp.content}")
+            context_lines.append(f"   提出者: {vp.proposer} | 投票: {votes_info}")
+            if vp.evidence:
+                context_lines.append(f"   论据: {'; '.join(vp.evidence[:2])}")
+            context_lines.append("")  # 空行
+
+    # 显示已解决的观点
+    resolved = [vp for vp in viewpoint_pool if vp.status != ViewpointStatus.ACTIVE]
+    if resolved:
+        context_lines.append(f"🟢 已解决 {len(resolved)} 个观点\n")
+
+    context_lines.append("=== 规则 ===")
+    context_lines.append("1. 先回应所有活跃观点（用 respond_to_viewpoint）")
+    context_lines.append("2. 再提出新观点（用 propose_viewpoint，最多1个）")
+    context_lines.append("3. 最后给出投票结论")
 
     return "\n".join(context_lines)
 
@@ -540,6 +553,7 @@ def run_review_with_viewpoint_pool(
     stream_callback: Optional[Callable[[str], None]] = None,
     previous_results: Optional[list[dict]] = None,
     token_callback: Optional[Callable[[dict], None]] = None,
+    stop_check_callback: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """带观点池上下文的角色评审
 
@@ -551,6 +565,7 @@ def run_review_with_viewpoint_pool(
         stream_callback: 流式回调函数
         previous_results: 之前角色的评审结果
         token_callback: Token使用量回调
+        stop_check_callback: 可选的停止检查回调，返回 True 表示应该停止
 
     Returns:
         评审结果 {role, content, vote, new_viewpoints}
@@ -626,6 +641,13 @@ def run_review_with_viewpoint_pool(
 
     # 流式调用
     for chunk in client.stream(messages):
+        # 实时停止检查：每个 chunk 处理前检查停止信号
+        if stop_check_callback and stop_check_callback():
+            if stream_callback:
+                stream_callback("\n⏹ 用户停止评审\n")
+            full_response += "\n[用户手动停止评审]"
+            break
+            
         chunk_text = _format_chunk_content(chunk)
         if chunk_text:
             full_response += chunk_text
@@ -676,6 +698,7 @@ def run_review_with_tools(
     previous_results: Optional[list[dict]] = None,
     token_callback: Optional[Callable[[dict], None]] = None,
     max_iterations: int = 10,
+    stop_check_callback: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """带工具调用的多段思考评审（ReAct 模式）
 
@@ -694,11 +717,15 @@ def run_review_with_tools(
         previous_results: 之前角色的评审结果
         token_callback: Token使用量回调
         max_iterations: 最大迭代次数（防止无限循环）
+        stop_check_callback: 可选的停止检查回调，返回 True 表示应该停止
 
     Returns:
         评审结果 {role, content, vote, new_viewpoints, tool_calls}
     """
     try:
+        import warnings
+        # 忽略弃用警告
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
         from langgraph.prebuilt import create_react_agent
         from langchain_core.messages import HumanMessage
     except ImportError:
@@ -725,76 +752,97 @@ def run_review_with_tools(
     # 添加观点池上下文
     input_text += "\n" + build_viewpoint_pool_context(viewpoint_pool)
 
+    # 如果有活跃观点，强制要求先回应
+    active_viewpoints = [vp for vp in viewpoint_pool if vp.status == ViewpointStatus.ACTIVE]
+    if active_viewpoints:
+        input_text += f"""
+⚠️  【强制要求】当前有 {len(active_viewpoints)} 个活跃观点待回应！
+你必须先对每个观点调用 respond_to_viewpoint 表达立场，
+然后才能提出新观点（每人每轮最多1个）。
+"""
+
     # 如果有之前的评审结果，添加辩论历史
     if previous_results:
         import re
-        input_text += "\n=== 之前角色的观点 ===\n"
+        input_text += "\n=== 之前角色的评审 ===\n"
         for result in previous_results:
             role_name = result.get("role", "未知")
             role_content = result.get("content", "")
             role_vote = result.get("vote", "")
+            tool_calls = result.get("tool_calls", [])
 
+            # 显示立场
+            vote_icon = "👍" if role_vote == "赞成" else "👎" if role_vote == "反对" else "🤔" if role_vote == "弃权" else "❓"
+            input_text += f"\n【{role_name}】{vote_icon} {role_vote or '未投票'}\n"
+
+            # 显示观点回应（respond_to_viewpoint）
+            responded_viewpoints = []
+            for tc in tool_calls:
+                if tc.get("tool") == "respond_to_viewpoint":
+                    args = tc.get("arguments", {})
+                    vp_id = args.get("viewpoint_id", "")
+                    stance = args.get("stance", "")
+                    response = args.get("response", "")[:100]
+                    responded_viewpoints.append(f"    ↳ 回应[{vp_id}]: {stance} - {response}...")
+
+            if responded_viewpoints:
+                input_text += "  对观点的回应:\n"
+                input_text += "\n".join(responded_viewpoints) + "\n"
+
+            # 显示提出的新观点
+            proposed_viewpoints = []
+            for tc in tool_calls:
+                if tc.get("tool") == "propose_viewpoint":
+                    args = tc.get("arguments", {})
+                    content = args.get("content", "")[:80]
+                    stance = args.get("stance", "")
+                    proposed_viewpoints.append(f"    ✨ 提出: [{stance}] {content}...")
+
+            if proposed_viewpoints:
+                input_text += "  提出新观点:\n"
+                input_text += "\n".join(proposed_viewpoints) + "\n"
+
+            # 显示主要内容摘要
             points = []
             point_pattern = r"论点\d+[:：]([^\n]+)"
             for match in re.finditer(point_pattern, role_content):
                 points.append(match.group(1).strip())
 
-            input_text += f"\n【{role_name}】立场: {role_vote or '未知'}\n"
             if points:
                 for i, p in enumerate(points[:3], 1):
-                    input_text += f"  论点{i}: {p[:100]}...\n"
+                    input_text += f"  论点{i}: {p[:100]}\n"
             else:
-                input_text += f"  观点: {role_content[:200]}...\n"
+                # 提取总结部分
+                summary_match = re.search(r"总结[:：]?\s*(.+?)(?=\n##|\n$|$)", role_content, re.DOTALL)
+                if summary_match:
+                    summary = summary_match.group(1).strip()[:200]
+                    input_text += f"  总结: {summary}...\n"
 
     # 添加工具使用说明
     input_text += """
-=== 可用工具 ===
-你可以调用以下工具来获取信息或管理观点：
+=== 工具（必须使用） ===
 
-【信息获取工具】
-- file_read: 读取文件内容。参数: file_path(文件路径)
-- file_search: 递归查找文件。参数: start_dir(起始目录), pattern(文件匹配模式, 如 "*.py")
-- code_search: 在代码中搜索正则表达式。参数: pattern(正则表达式), file_pattern(文件匹配模式)
-- list_dir: 列出目录内容。参数: dir_path(目录路径)
+1. respond_to_viewpoint - 回应活跃观点
+   必用！先调用这个回应所有观点
 
-【观点管理工具】（非常重要，必须使用）
-- propose_viewpoint: 提出新观点到观点池。
-  参数:
-    - content: 观点内容（一句话概括核心问题）
-    - evidence: 支撑论据列表（JSON数组格式，如 ["论据1", "论据2"]）
-    - stance: 你的立场（必须是 "赞成"、"反对" 或 "弃权" 之一）
-  示例: propose_viewpoint({"content": "API设计过于复杂", "evidence": ["接口参数过多", "缺乏默认值"], "stance": "反对"})
+2. propose_viewpoint - 提出新观点（可选，最多1个）
+   在回应完所有观点后才能用
 
-- respond_to_viewpoint: 回应观点池中的已有观点。
-  参数:
-    - viewpoint_id: 要回应的观点ID
-    - response: 你的回应内容
-    - stance: 你对该观点的立场（"赞成"、"反对" 或 "弃权"）
-  示例: respond_to_viewpoint({"viewpoint_id": "VP-001", "response": "同意此观点，补充如下...", "stance": "赞成"})
-
-=== 核心规则（必须遵守） ===
-【重要】如果你发现了新的设计问题或关注点，必须通过调用 propose_viewpoint 工具来添加观点，而不是在回复文本中提及！
-【重要】如果你想对现有观点表达立场，必须调用 respond_to_viewpoint 工具！
-【重要】只有在观点池已满（已有3个活跃观点）时，才不能提出新观点！
-
-=== 思考流程 ===
-1. 先思考是否需要调用工具获取更多信息
-2. 如果需要，调用相关工具
-3. 如果观点池未满且发现新问题，调用 propose_viewpoint 提出新观点（这是唯一添加观点的方式！）
-4. 对观点池中的现有观点，调用 respond_to_viewpoint 表达你的立场
-5. 根据工具返回的结果继续思考
-6. 最终给出评审结论
-
-=== 输出格式 ===
-## 肯定点
-- [如果有值得肯定的设计]
-
-## 总结
-[对你的整体评审结果]
+【强制顺序】respond_to_viewpoint → propose_viewpoint → 结束
 """
 
     # 获取工具列表
     tools = get_all_tools()
+
+    # 设置工具调用回调（用于实时通知 UI）
+    from .tools import set_tool_invoke_callback
+
+    def tool_invoke_cb(tool_name: str, args: dict, result: str):
+        if stream_callback:
+            tool_info = f"\n🔧 调用工具: {tool_name}({json.dumps(args, ensure_ascii=False, indent=2)[:200]})"
+            stream_callback(tool_info)
+
+    set_tool_invoke_callback(tool_invoke_cb)
 
     # 创建 ReAct Agent
     try:
@@ -829,13 +877,32 @@ def run_review_with_tools(
             {"messages": [HumanMessage(content=input_text)]},
             {"recursion_limit": max_thought_cycles * 3},  # 每个思考轮次可能产生多个事件
         ):
+            # 实时停止检查：每个事件处理前检查停止信号
+            if stop_check_callback and stop_check_callback():
+                if stream_callback:
+                    stream_callback("\n⏹ 用户停止评审\n")
+                full_response += "\n[用户手动停止评审]"
+                break
+
             if force_stop:
                 break
 
             try:
-                # 处理事件，提取消息内容
+                # LangGraph ReAct Agent 返回的事件结构可能是:
+                # - {'agent': {'messages': [...]}}  (新版本)
+                # - {'messages': [...]}  (旧版本)
+                messages = None
                 if "messages" in event:
-                    for message in event["messages"]:
+                    messages = event["messages"]
+                elif "agent" in event and isinstance(event.get("agent"), dict) and "messages" in event["agent"]:
+                    messages = event["agent"]["messages"]
+
+                if messages:
+                    for message in messages:
+                        # 类型检查：确保是 BaseMessage 类型
+                        if not hasattr(message, 'content'):
+                            continue
+
                         # 检测 AI 是否开始新的一轮思考（决定调用工具）
                         if hasattr(message, 'tool_calls') and message.tool_calls:
                             thought_cycle_count += 1
@@ -847,62 +914,79 @@ def run_review_with_tools(
                                 force_stop = True
                                 break
 
-                        # AI 的思考和回复
-                        if hasattr(message, 'content') and message.content:
-                            content_str = str(message.content)
-                            # 过滤掉纯工具调用定义，保留思考内容和最终回复
-                            # 只过滤以 JSON 格式的工具调用块
-                            lines = content_str.split('\n')
-                            filtered_lines = []
-                            skip_next = False
-                            for i, line in enumerate(lines):
-                                if skip_next:
-                                    skip_next = False
-                                    continue
-                                # 跳过纯 JSON 工具调用块
-                                if line.strip().startswith('"name":') or line.strip().startswith('"args"'):
-                                    # 检查是否是工具调用定义的一部分
-                                    if i > 0 and ('tool_calls' in lines[i-1] or 'function' in lines[i-1].lower()):
-                                        skip_next = True
-                                        continue
-                                filtered_lines.append(line)
-
-                            clean_content = '\n'.join(filtered_lines).strip()
-                            if clean_content:
-                                full_response += clean_content + "\n"
-                                if stream_callback:
-                                    stream_callback(clean_content)
-
-                        # 工具调用记录
-                        if hasattr(message, 'tool_calls') and message.tool_calls:
-                            for tc in message.tool_calls:
-                                tool_calls.append({
-                                    "tool": tc.get("name", "unknown"),
-                                    "arguments": tc.get("args", {}),
-                                })
-
-                # 处理工具结果（带错误恢复）
-                if "tool" in event:
-                    tool_result = event["tool"]
-                    try:
-                        if hasattr(tool_result, 'content'):
-                            result_content = str(tool_result.content)
-                            # 将工具结果添加到响应中
-                            if result_content and result_content.strip():
-                                tool_result_text = f"\n[工具结果: {result_content[:200]}]\n"
+                        # 处理 ToolMessage（工具执行结果）
+                        if hasattr(message, 'type') and message.type == 'tool':
+                            # ToolMessage 的 content 已经是字符串格式的工具结果
+                            tool_result_content = str(message.content) if message.content else ""
+                            if tool_result_content and tool_result_content.strip():
+                                tool_result_text = f"\n[工具结果: {tool_result_content[:300]}]\n"
                                 full_response += tool_result_text
                                 if stream_callback:
                                     stream_callback(tool_result_text)
-                            if tool_calls:
-                                tool_calls[-1]["result"] = result_content[:500] if result_content else ""
-                    except Exception as tool_err:
-                        # 单个工具调用失败不影响整体
-                        error_text = f"\n[工具执行错误: {str(tool_err)[:100]}]\n"
-                        full_response += error_text
-                        if stream_callback:
-                            stream_callback(error_text)
-                        if tool_calls:
-                            tool_calls[-1]["result"] = f"错误: {str(tool_err)[:200]}"
+                                # 更新最后一个工具调用的结果
+                                if tool_calls:
+                                    tool_calls[-1]["result"] = tool_result_content[:500] if tool_result_content else ""
+                            continue  # 已处理 ToolMessage，跳过后续处理
+
+                        # 处理 AIMessage（AI 的思考和回复）
+                        if hasattr(message, 'type') and message.type == 'ai':
+                            # 检查是否有工具调用（使用更可靠的方式）
+                            message_tool_calls = getattr(message, 'tool_calls', None) or getattr(message, 'tool_call_data', None)
+                            if message_tool_calls:
+                                # 获取工具调用列表
+                                tc_list = message_tool_calls if isinstance(message_tool_calls, list) else [message_tool_calls]
+                                for tc in tc_list:
+                                    # 提取工具名称和参数
+                                    tool_name = None
+                                    tool_args = {}
+
+                                    # 兼容不同的 tool_calls 格式
+                                    if isinstance(tc, dict):
+                                        tool_name = tc.get("name") or tc.get("function", {}).get("name")
+                                        tool_args = tc.get("args") or tc.get("function", {}).get("arguments") or {}
+                                    elif hasattr(tc, 'name'):
+                                        tool_name = tc.name
+                                        tool_args = getattr(tc, 'args', {}) or {}
+
+                                    if tool_name:
+                                        tool_calls.append({
+                                            "tool": tool_name,
+                                            "arguments": tool_args,
+                                            "result": ""
+                                        })
+                                        # 实时显示工具调用
+                                        if stream_callback:
+                                            args_str = json.dumps(tool_args, ensure_ascii=False, indent=2)
+                                            if len(args_str) > 150:
+                                                args_str = args_str[:150] + "..."
+                                            tool_info = f"\n🔧 调用工具: {tool_name}\n  参数: {args_str}"
+                                            stream_callback(tool_info)
+                                # 如果只有工具调用定义（没有思考内容），跳过显示
+                                if not message.content or not str(message.content).strip():
+                                    continue
+
+                            # 有实际内容的 AI 消息（思考或最终回复）-> 显示
+                            if message.content and str(message.content).strip():
+                                content_str = str(message.content)
+                                # 过滤掉工具调用定义块
+                                lines = content_str.split('\n')
+                                filtered_lines = []
+                                skip_next = False
+                                for i, line in enumerate(lines):
+                                    if skip_next:
+                                        skip_next = False
+                                        continue
+                                    if line.strip().startswith('"name":') or line.strip().startswith('"args"'):
+                                        if i > 0 and ('tool_calls' in lines[i-1] or 'function' in lines[i-1].lower()):
+                                            skip_next = True
+                                            continue
+                                    filtered_lines.append(line)
+
+                                clean_content = '\n'.join(filtered_lines).strip()
+                                if clean_content:
+                                    full_response += clean_content + "\n"
+                                    if stream_callback:
+                                        stream_callback(clean_content)
 
             except Exception as event_err:
                 # 单个事件处理失败，继续处理下一个

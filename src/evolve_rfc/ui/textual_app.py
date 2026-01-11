@@ -389,15 +389,10 @@ class EvolveRFCApp(App):
             if role_data.get("role"):
                 app.call_from_thread(self._update_workflow_role, role_data.get("role"), role_data.get("status", "idle"))
 
-        def finish_cb(role: str, tool_calls: list):
-            """评审结束回调，显示工具调用信息"""
-            app.call_from_thread(self._finish_review_with_tools, role, tool_calls)
-
         # 在当前线程的 context 中设置回调
         token_callback_var.set(token_cb)
         log_callback_var.set(log_cb)
         workflow_state_callback_var.set(workflow_state_cb)
-        finish_callback_var.set(finish_cb)
 
         # 尝试设置 stream_callback_var，使用 copy_context 以便在子线程中访问
         try:
@@ -484,15 +479,10 @@ class EvolveRFCApp(App):
             if role_data.get("role"):
                 app.call_from_thread(self._update_workflow_role, role_data.get("role"), role_data.get("status", "idle"))
 
-        def finish_cb(role: str, tool_calls: list):
-            """评审结束回调，显示工具调用信息"""
-            app.call_from_thread(self._finish_review_with_tools, role, tool_calls)
-
         # 在当前线程的 context 中设置回调
         token_callback_var.set(token_cb)
         log_callback_var.set(log_cb)
         workflow_state_callback_var.set(workflow_state_cb)
-        finish_callback_var.set(finish_cb)
 
         # 尝试设置 stream_callback_var，使用 copy_context 以便在子线程中访问
         try:
@@ -536,6 +526,7 @@ class EvolveRFCApp(App):
     def _run_workflow(self, workflow, initial_state, app, token_stats_map):
         """运行工作流的通用方法"""
         final_state = None
+        last_vote_result = None
         for state in workflow.stream(initial_state):
             if not self._review_running:
                 app.call_from_thread(self._log_review, "[yellow]⏹ 评审已手动停止[/]")
@@ -549,6 +540,31 @@ class EvolveRFCApp(App):
             if state.get("workflow_status") == "待人类决策":
                 app.call_from_thread(self._log_review, "\n[bold yellow]⚠️ 需要人类介入[/]")
                 break
+
+            # 收集投票结果用于显示
+            events = state.get("events", [])
+            current_round = state.get("current_round", 1)
+            vote_data = {}
+            for event in events:
+                if hasattr(event, 'vote_result') and event.vote_result and event.metadata.get("round") == current_round:
+                    vote_data[event.actor] = {
+                        "vote": event.vote_result,
+                        "reasoning": ""
+                    }
+            
+            # 统计投票
+            if vote_data:
+                yes_count = sum(1 for v in vote_data.values() if v["vote"] == "赞成")
+                no_count = sum(1 for v in vote_data.values() if v["vote"] == "反对")
+                abstain_count = sum(1 for v in vote_data.values() if v["vote"] == "弃权")
+                
+                vote_result = {
+                    "yes": yes_count,
+                    "no": no_count,
+                    "abstain": abstain_count,
+                    "role_data": vote_data
+                }
+                app.call_from_thread(self._update_vote_display, vote_result, len(vote_data))
 
             final_state = state
 
@@ -592,7 +608,15 @@ class EvolveRFCApp(App):
             if "role_data" in vote_result:
                 for role, data in vote_result["role_data"].items():
                     vote = data.get("vote", "")
-                    icon = "👍" if vote == "for" else "👎" if vote == "against" else "🤔"
+                    # 支持中英文投票结果
+                    if vote in ["赞成", "for", "for", "支持", "同意"]:
+                        icon = "👍"
+                    elif vote in ["反对", "against", "against", "不支持"]:
+                        icon = "👎"
+                    elif vote in ["弃权", "abstain", "abstain", "不发表意见"]:
+                        icon = "🤔"
+                    else:
+                        icon = "❓"
                     reason = data.get("reasoning", "")
                     if len(reason) > 30:
                         reason = reason[:27] + "..."
@@ -607,27 +631,53 @@ class EvolveRFCApp(App):
             if not token_table.columns:
                 token_table.add_columns("角色", "输入", "输出", "合计", "%")
             token_table.clear()
+
+            # 累计总 token
+            total_input = 0
+            total_output = 0
+            total_tokens = 0
+            max_usage_percent = 0.0
+            max_tokens = 0
+
             for role, stats in sorted(stats_map.items()):
                 # 支持字典格式和对象格式
                 if isinstance(stats, dict):
                     input_tokens = stats.get("input_tokens", 0)
                     output_tokens = stats.get("output_tokens", 0)
-                    total_tokens = stats.get("total_tokens", 0)
+                    role_total = stats.get("total_tokens", 0)
                     usage_percent = stats.get("usage_percent", 0.0)
+                    role_max = stats.get("max_tokens", 0)
                 else:
                     # 对象格式（如 TokenStats）
                     input_tokens = getattr(stats, 'input_tokens', 0)
                     output_tokens = getattr(stats, 'output_tokens', 0)
-                    total_tokens = getattr(stats, 'total_tokens', 0)
+                    role_total = getattr(stats, 'total_tokens', 0)
                     usage_percent = getattr(stats, 'usage_percent', 0.0)
-                
+                    role_max = getattr(stats, 'max_tokens', 0)
+
+                total_input += input_tokens
+                total_output += output_tokens
+                total_tokens += role_total
+                max_usage_percent = max(max_usage_percent, usage_percent)
+                max_tokens = max(max_tokens, role_max)
+
                 token_table.add_row(
                     str(role),
                     f"{input_tokens:,}",
                     f"{output_tokens:,}",
-                    f"{total_tokens:,}",
+                    f"{role_total:,}",
                     f"{usage_percent:.1f}%" if usage_percent else "0%",
                 )
+
+            # 添加总计行
+            total_usage_percent = (total_tokens / max_tokens * 100) if max_tokens > 0 else 0
+            token_table.add_row(
+                "━━ 总计 ━━",
+                f"{total_input:,}",
+                f"{total_output:,}",
+                f"{total_tokens:,}",
+                f"{total_usage_percent:.1f}%",
+            )
         except Exception as e:
             self._log_review(f"[yellow]更新Token统计失败: {e}[/]")
 
@@ -665,21 +715,6 @@ class EvolveRFCApp(App):
         except Exception:
             pass
 
-    def _finish_review_with_tools(self, role: str, tool_calls: list):
-        """评审结束，显示工具调用信息"""
-        # 显示工具调用信息
-        if tool_calls:
-            self._log_review(f"\n[bold yellow]🔧 {role} 工具调用记录:[/]")
-            for tc in tool_calls:
-                tool_name = tc.get("tool", "unknown")
-                args = tc.get("arguments", {})
-                result = tc.get("result", "")
-                args_str = str(args)[:80] if args else ""
-                result_str = str(result)[:80] if result else ""
-                self._log_review(f"  • {tool_name}({args_str}) → {result_str}")
-        
-        # 调用原有的 finish 逻辑
-        self._finish_review()
 
 
 def run_textual_app():
