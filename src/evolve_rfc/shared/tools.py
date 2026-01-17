@@ -30,6 +30,9 @@ _tool_call_history: List[ToolCallRecord] = []
 
 _viewpoint_pool_for_tool: List = []
 
+_current_role_for_tool: Optional[str] = None
+_role_viewpoint_counts: Dict[str, int] = {}
+
 _tool_invoke_callback: Optional[Callable[[str, Dict, str], None]] = None
 
 
@@ -50,13 +53,20 @@ def notify_tool_invoke(tool_name: str, arguments: Dict[str, Any], result: str = 
 
 
 def get_viewpoints_from_tool() -> List[dict]:
-    """获取通过工具调用添加的观点"""
+    """获取通过工具调用添加的观点（默认返回当前角色的观点）"""
+    if _current_role_for_tool:
+        return [
+            vp
+            for vp in _viewpoints_from_tool
+            if vp.get("proposer") == _current_role_for_tool
+        ]
     return _viewpoints_from_tool
 
 
 def clear_viewpoints_from_tool():
-    """不清空观点，让观点积累供其他AI看到"""
-    pass
+    """清空当前工具会话的观点缓存（每个角色独立）"""
+    global _viewpoints_from_tool
+    _viewpoints_from_tool = []
 
 
 def get_tool_call_history() -> List[ToolCallRecord]:
@@ -96,6 +106,22 @@ def clear_viewpoint_pool_for_tool():
     """清空工具视角的观点池"""
     global _viewpoint_pool_for_tool
     _viewpoint_pool_for_tool = []
+
+
+# === 角色上下文管理 ===
+def set_current_role_for_tool(role: str):
+    """设置当前工具调用所属角色"""
+    global _current_role_for_tool
+    _current_role_for_tool = role
+    if role not in _role_viewpoint_counts:
+        _role_viewpoint_counts[role] = 0
+
+
+def clear_role_context_for_tool():
+    """清空角色上下文（用于每次角色评审开始前重置）"""
+    global _current_role_for_tool, _role_viewpoint_counts
+    _current_role_for_tool = None
+    _role_viewpoint_counts = {}
 
 
 # === 使用 @tool 装饰器定义工具 ===
@@ -376,11 +402,11 @@ def propose_viewpoint(
     if len(content.strip()) < 5:
         return "错误: content 内容太短，请提供更详细的问题描述"
 
-    # 检查是否超过限制
+    # 检查每个角色是否超过限制（每人每轮最多1个）
     global _viewpoints_from_tool
-    current = _viewpoints_from_tool
-    if len(current) >= 3:
-        return "观点池已满（最多3个观点），不能提出新观点。请先回应现有观点，或等待观点被解决。"
+    role_name = _current_role_for_tool or "unknown"
+    if _role_viewpoint_counts.get(role_name, 0) >= 1:
+        return "错误: 每个角色每轮最多提出1个新观点"
 
     # 验证立场
     if stance not in ["赞成", "反对", "弃权"]:
@@ -394,9 +420,11 @@ def propose_viewpoint(
         "content": content,
         "evidence": evidence[:3],  # 最多3个论据
         "stance": stance,
+        "proposer": role_name,
     }
 
-    _viewpoints_from_tool = current + [viewpoint]
+    _viewpoints_from_tool = _viewpoints_from_tool + [viewpoint]
+    _role_viewpoint_counts[role_name] = _role_viewpoint_counts.get(role_name, 0) + 1
 
     # 记录工具调用
     record_tool_call("propose_viewpoint", {
@@ -412,7 +440,7 @@ def propose_viewpoint(
         "stance": stance,
     }, f"观点已添加：{content[:50]}...")
 
-    return f"观点已添加到观点池：{content[:50]}...（当前池中 {len(current) + 1}/3 个观点）"
+    return f"观点已添加到观点池：{content[:50]}...（当前角色本轮已提出 {_role_viewpoint_counts[role_name]}/1 个观点）"
 
 
 @tool
@@ -505,3 +533,4 @@ def cleanup_tool_context():
     clear_viewpoints_from_tool()
     clear_tool_call_history()
     clear_viewpoint_pool_for_tool()
+    clear_role_context_for_tool()

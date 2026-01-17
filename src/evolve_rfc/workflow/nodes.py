@@ -23,7 +23,11 @@ from ..core.state import (
 )
 from ..agents import get_role_prompt, get_reviewer_roles
 from ..shared import run_review_with_viewpoint_pool, run_review_with_tools
-from ..shared.tools import cleanup_tool_context, set_viewpoint_pool_for_tool
+from ..shared.tools import (
+    cleanup_tool_context,
+    set_viewpoint_pool_for_tool,
+    set_current_role_for_tool,
+)
 
 
 # 全局 LLM 客户端缓存
@@ -133,7 +137,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
     """
     rfc_content = state["rfc_content"]
     current_round = state["current_round"]
-    viewpoint_pool = state["viewpoint_pool"]
+    working_pool = list(state["viewpoint_pool"])
 
     # 获取外部回调
     external_stream_cb = stream_callback_var.get()
@@ -147,6 +151,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
 
     # 使用带观点池的评审逻辑
     review_results = []
+    role_viewpoint_count: dict[str, int] = {}  # 记录每个角色本轮已提出观点数
 
     # 在开始评审前清理工具上下文（防止数据残留）
     cleanup_tool_context()
@@ -158,8 +163,9 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
         # 在每个角色评审开始前清理工具上下文
         cleanup_tool_context()
 
-        # 设置观点池上下文，让工具可以读取当前观点池
-        set_viewpoint_pool_for_tool(list(viewpoint_pool))
+        # 设置当前角色 + 观点池上下文，让工具可以读取当前观点池
+        set_current_role_for_tool(role)
+        set_viewpoint_pool_for_tool(list(working_pool))
 
         # 创建流式回调包装器
         def make_callback(rl: str) -> Callable[[str], None]:
@@ -191,7 +197,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
                     role=role,
                     content=rfc_content,
                     current_round=current_round,
-                    viewpoint_pool=viewpoint_pool,
+                    viewpoint_pool=working_pool,
                     stream_callback=role_callback,
                     previous_results=review_results,
                     token_callback=role_token_callback,
@@ -207,7 +213,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
                     role=role,
                     content=rfc_content,
                     current_round=current_round,
-                    viewpoint_pool=viewpoint_pool,
+                    viewpoint_pool=working_pool,
                     stream_callback=role_callback,
                     previous_results=review_results,
                     token_callback=role_token_callback,
@@ -215,12 +221,79 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
                 )
             review_results.append(result)
         except Exception as e:
-            review_results.append({
+            result = {
                 "role": role,
                 "content": f"评审失败：{str(e)}",
                 "vote": "弃权",
                 "new_viewpoints": [],
-            })
+            }
+            review_results.append(result)
+
+        # 更新观点池：同步回应（respond_to_viewpoint）
+        tool_calls = result.get("tool_calls", [])
+        for tc in tool_calls:
+            if tc.get("tool") == "respond_to_viewpoint":
+                args = tc.get("arguments", {})
+                vp_id = args.get("viewpoint_id", "")
+                stance = args.get("stance", "")
+                response = args.get("response", "")
+
+                for i, vp in enumerate(working_pool):
+                    if vp.id == vp_id:
+                        new_arguments = list(vp.arguments)
+                        new_arguments.append(
+                            {
+                                "actor": role,
+                                "content": response,
+                                "stance": stance,
+                                "round": current_round,
+                            }
+                        )
+
+                        new_vote_count = vp.vote_count.copy()
+                        if stance in new_vote_count:
+                            new_vote_count[stance] += 1
+
+                        from ..core.state import Viewpoint as VPClass
+
+                        working_pool[i] = VPClass(
+                            id=vp.id,
+                            content=vp.content,
+                            evidence=vp.evidence,
+                            proposer=vp.proposer,
+                            status=vp.status,
+                            vote_count=new_vote_count,
+                            created_round=vp.created_round,
+                            resolved_round=vp.resolved_round,
+                            solutions=vp.solutions,
+                            arguments=new_arguments,
+                        )
+                        break
+
+        # 更新观点池：新增观点（每人每轮最多1个）
+        if (
+            role_viewpoint_count.get(role, 0) < 1
+            and len(working_pool) < VIEWPOINT_POOL_LIMIT
+        ):
+            vp_data_list = result.get("new_viewpoints", [])
+            selected_vp = None
+            for vp_data in vp_data_list:
+                if vp_data.get("is_new", True):
+                    selected_vp = vp_data
+                    break
+            if selected_vp is None and vp_data_list:
+                selected_vp = vp_data_list[0]
+
+            if selected_vp:
+                working_pool.append(
+                    create_viewpoint(
+                        content=selected_vp.get("content", ""),
+                        evidence=selected_vp.get("evidence", []),
+                        proposer=role,
+                        created_round=current_round,
+                    )
+                )
+                role_viewpoint_count[role] = 1
 
         # 通知 UI 评审结束
         last_vote = review_results[-1].get("vote") if review_results else "弃权"
@@ -257,84 +330,6 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
             vote_result=vote,  # 包含投票结果
         ))
 
-    # 收集所有新观点（限制：每人每轮1个，总量不超过池上限）
-    new_viewpoints = []
-    current_pool_size = len(state["viewpoint_pool"])
-    role_viewpoint_count: dict[str, int] = {}  # 记录每个角色本轮已提出观点数
-
-    for result in review_results:
-        role = result.get("role", "未知")
-
-        # 该角色本轮已提出过观点，跳过
-        if role_viewpoint_count.get(role, 0) >= 1:
-            continue
-
-        # 观点池已满，跳过
-        if current_pool_size + len(new_viewpoints) >= VIEWPOINT_POOL_LIMIT:
-            break
-
-        # 只取该角色的第一个观点
-        vp_data_list = result.get("new_viewpoints", [])
-        if not vp_data_list:
-            continue
-
-        # 只取第一个观点
-        vp_data = vp_data_list[0]
-        new_viewpoints.append(create_viewpoint(
-            content=vp_data.get("content", ""),
-            evidence=vp_data.get("evidence", []),
-            proposer=role,
-            created_round=current_round,
-        ))
-        role_viewpoint_count[role] = 1
-
-    # 同步观点回应到观点池（更新 arguments）
-    updated_pool = list(state["viewpoint_pool"])  # 复制当前观点池
-    for result in review_results:
-        role = result.get("role", "未知")
-        tool_calls = result.get("tool_calls", [])
-
-        for tc in tool_calls:
-            if tc.get("tool") == "respond_to_viewpoint":
-                args = tc.get("arguments", {})
-                vp_id = args.get("viewpoint_id", "")
-                stance = args.get("stance", "")
-                response = args.get("response", "")
-
-                # 找到对应的观点并更新
-                for i, vp in enumerate(updated_pool):
-                    if vp.id == vp_id:
-                        # 添加论证记录
-                        new_arguments = list(vp.arguments)
-                        new_arguments.append({
-                            "actor": role,
-                            "content": response,
-                            "stance": stance,
-                            "round": current_round,
-                        })
-
-                        # 更新投票统计
-                        new_vote_count = vp.vote_count.copy()
-                        if stance in new_vote_count:
-                            new_vote_count[stance] += 1
-
-                        # 创建更新后的观点
-                        from ..core.state import Viewpoint as VPClass
-                        updated_vp = VPClass(
-                            id=vp.id,
-                            content=vp.content,
-                            evidence=vp.evidence,
-                            proposer=vp.proposer,
-                            status=vp.status,
-                            vote_count=new_vote_count,
-                            created_round=vp.created_round,
-                            resolved_round=vp.resolved_round,
-                            solutions=vp.solutions,
-                            arguments=new_arguments,
-                        )
-                        updated_pool[i] = updated_vp
-                        break  # 找到一个就停止
-
     # 构建最终状态（只返回一次状态更新）
     result_state = DiscussionState(
         events=state["events"] + new_events,
@@ -345,7 +340,7 @@ def parallel_review_node(state: DiscussionState) -> DiscussionState:
         current_focus=state["current_focus"],
         consensus_points=state["consensus_points"],
         open_issues=state["open_issues"],
-        viewpoint_pool=updated_pool + new_viewpoints,
+        viewpoint_pool=working_pool,
         resolved_viewpoints=state["resolved_viewpoints"],
         awaiting_human_input=state["awaiting_human_input"],
         human_decision=state["human_decision"],
