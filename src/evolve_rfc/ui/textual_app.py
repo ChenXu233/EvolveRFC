@@ -31,12 +31,20 @@ from evolve_rfc.workflow.nodes import (
     token_callback_var,
     log_callback_var,
     workflow_state_callback_var,
-    finish_callback_var,
     _review_running_var,
     get_latest_saved_state,
-    save_workflow_state,
 )
-from evolve_rfc.core.state import DiscussionState, create_initial_state
+from typing import Literal, cast
+
+from evolve_rfc.core.state import (
+    DiscussionState,
+    DiscussionEvent,
+    EventType,
+    Viewpoint,
+    ViewpointStatus,
+    resolve_viewpoint,
+    create_initial_state,
+)
 from evolve_rfc.ui.widgets import (
     WelcomeScreen,
     WorkflowStatusPanel,
@@ -50,6 +58,8 @@ class EvolveRFCApp(App):
     _review_running = False
     _review_worker = None
     _saved_state_path = None  # 保存的状态文件路径
+    _latest_state: DiscussionState | None = None
+    _selected_viewpoint_id: str | None = None
 
     CSS = """
     /* 基础样式 */
@@ -184,6 +194,22 @@ class EvolveRFCApp(App):
         height: 1fr;
     }
 
+    #viewpoint-controls {
+        height: auto;
+        padding: 1;
+        background: $panel;
+        border-top: solid $primary;
+    }
+
+    #viewpoint-controls > * {
+        margin-right: 1;
+        height: auto;
+    }
+
+    #viewpoint_response {
+        width: 1fr;
+    }
+
     .stat-header {
         background: $secondary;
         color: $text;
@@ -261,6 +287,34 @@ class EvolveRFCApp(App):
                             yield DataTable(id="voting_table", classes="monitor-table")
                             yield Label("💰 Token 统计", classes="stat-header")
                             yield DataTable(id="token_table", classes="monitor-table")
+                            yield Label("💡 当前观点", classes="stat-header")
+                            yield DataTable(
+                                id="viewpoint_table", classes="monitor-table"
+                            )
+                            with Vertical(id="viewpoint-controls"):
+                                yield Input(
+                                    placeholder="人类备注/理由（可选）",
+                                    id="viewpoint_response",
+                                )
+                                with Horizontal():
+                                    yield Button(
+                                        "👍 赞成", id="vp_vote_yes", variant="success"
+                                    )
+                                    yield Button(
+                                        "👎 反对", id="vp_vote_no", variant="error"
+                                    )
+                                    yield Button("🤔 弃权", id="vp_vote_abstain")
+                                    yield Button(
+                                        "✅ 标记解决",
+                                        id="vp_resolve",
+                                        variant="primary",
+                                    )
+                                    yield Button(
+                                        "🛑 标记拒绝", id="vp_reject", variant="error"
+                                    )
+                                    yield Button(
+                                        "▶ 继续评审", id="vp_resume", variant="primary"
+                                    )
             with TabPane("夜间守护", id="nightly"):
                 with Horizontal(id="nightly-controls"):
                     yield Label("🌙 夜间守护进程", classes="pane-title")
@@ -526,7 +580,6 @@ class EvolveRFCApp(App):
     def _run_workflow(self, workflow, initial_state, app, token_stats_map):
         """运行工作流的通用方法"""
         final_state = None
-        last_vote_result = None
         for state in workflow.stream(initial_state):
             if not self._review_running:
                 app.call_from_thread(self._log_review, "[yellow]⏹ 评审已手动停止[/]")
@@ -566,10 +619,14 @@ class EvolveRFCApp(App):
                 }
                 app.call_from_thread(self._update_vote_display, vote_result, len(vote_data))
 
+            # 更新观点池显示
+            app.call_from_thread(self._update_viewpoint_display, state)
+
             final_state = state
 
         # 如果正常完成，显示最终结果
         if final_state and self._review_running:
+            self._latest_state = final_state
             viewpoint_pool = final_state.get("viewpoint_pool", [])
             resolved = len(final_state.get("resolved_viewpoints", []))
 
@@ -715,6 +772,202 @@ class EvolveRFCApp(App):
         except Exception:
             pass
 
+    def _update_viewpoint_display(self, state: DiscussionState):
+        """更新观点池显示"""
+        try:
+            self._latest_state = state
+            table = self.query_one("#viewpoint_table", DataTable)
+            if not table.columns:
+                table.add_columns(
+                    "ID", "状态", "观点", "提出者", "赞成", "反对", "弃权"
+                )
+            table.clear()
+
+            for vp in state.get("viewpoint_pool", []):
+                status_text = "🔴" if vp.status == ViewpointStatus.ACTIVE else "🟢"
+                table.add_row(
+                    vp.id,
+                    status_text,
+                    vp.content[:80],
+                    vp.proposer,
+                    str(vp.vote_count.get("赞成", 0)),
+                    str(vp.vote_count.get("反对", 0)),
+                    str(vp.vote_count.get("弃权", 0)),
+                    key=vp.id,
+                )
+        except Exception:
+            pass
+
+    def _get_selected_viewpoint(self) -> Viewpoint | None:
+        """获取当前选中的观点"""
+        if not self._latest_state or not self._selected_viewpoint_id:
+            return None
+        for vp in self._latest_state.get("viewpoint_pool", []):
+            if vp.id == self._selected_viewpoint_id:
+                return vp
+        return None
+
+    def _append_human_event(
+        self, action: str, viewpoint_id: str | None = None, content: str | None = None
+    ):
+        """记录人类操作事件"""
+        if not self._latest_state:
+            return
+        allowed_actions = [
+            "意见注入",
+            "参数调整",
+            "强制通过",
+            "强制驳回",
+            "继续",
+            "终止",
+        ]
+        human_action = (
+            cast(
+                Literal["意见注入", "参数调整", "强制通过", "强制驳回", "继续", "终止"],
+                action,
+            )
+            if action in allowed_actions
+            else None
+        )
+
+        self._latest_state["events"] = self._latest_state.get("events", []) + [
+            DiscussionEvent(
+                event_type=EventType.HUMAN_INTERVENTION,
+                actor="human",
+                content=content or action,
+                metadata={
+                    "action": action,
+                    "viewpoint_id": viewpoint_id,
+                    "round": self._latest_state.get("current_round", 0),
+                },
+                human_action=human_action,
+            )
+        ]
+
+    def _apply_human_vote(self, stance: str):
+        """人类对观点投票"""
+        if not self._latest_state:
+            self._log_review("[yellow]⚠️ 当前没有可操作的观点[/]")
+            return
+
+        vp = self._get_selected_viewpoint()
+        if not vp:
+            self._log_review("[yellow]⚠️ 请先选择一个观点[/]")
+            return
+
+        response_input = self.query_one("#viewpoint_response", Input)
+        response_text = response_input.value.strip() or "人类未提供理由"
+
+        new_vote_count = vp.vote_count.copy()
+        if stance in new_vote_count:
+            new_vote_count[stance] += 1
+
+        new_arguments = list(vp.arguments)
+        new_arguments.append(
+            {
+                "actor": "human",
+                "content": response_text,
+                "stance": stance,
+                "round": self._latest_state.get("current_round", 0),
+            }
+        )
+
+        updated_vp = Viewpoint(
+            id=vp.id,
+            content=vp.content,
+            evidence=vp.evidence,
+            proposer=vp.proposer,
+            status=vp.status,
+            vote_count=new_vote_count,
+            created_round=vp.created_round,
+            resolved_round=vp.resolved_round,
+            solutions=vp.solutions,
+            arguments=new_arguments,
+        )
+
+        updated_pool = [
+            updated_vp if v.id == vp.id else v
+            for v in self._latest_state.get("viewpoint_pool", [])
+        ]
+        self._latest_state["viewpoint_pool"] = updated_pool
+        self._append_human_event(
+            "意见注入", vp.id, f"人类投票 {stance}: {response_text}"
+        )
+        self._update_viewpoint_display(self._latest_state)
+
+    def _apply_human_resolution(self, status: ViewpointStatus):
+        """人类强制标记观点状态"""
+        if not self._latest_state:
+            self._log_review("[yellow]⚠️ 当前没有可操作的观点[/]")
+            return
+
+        vp = self._get_selected_viewpoint()
+        if not vp:
+            self._log_review("[yellow]⚠️ 请先选择一个观点[/]")
+            return
+
+        current_round = self._latest_state.get("current_round", 0)
+        resolved_vp = resolve_viewpoint(vp, current_round, status=status)
+
+        remaining_pool = [
+            v for v in self._latest_state.get("viewpoint_pool", []) if v.id != vp.id
+        ]
+        resolved_list = list(self._latest_state.get("resolved_viewpoints", []))
+        resolved_list.append(resolved_vp)
+
+        self._latest_state["viewpoint_pool"] = remaining_pool
+        self._latest_state["resolved_viewpoints"] = resolved_list
+        action = "强制通过" if status == ViewpointStatus.RESOLVED else "强制驳回"
+        self._append_human_event(action, vp.id, f"人类{action}观点 {vp.id}")
+        self._update_viewpoint_display(self._latest_state)
+
+    @on(DataTable.RowSelected, "#viewpoint_table")
+    def on_viewpoint_selected(self, event: DataTable.RowSelected):
+        self._selected_viewpoint_id = str(event.row_key)
+
+    @on(Button.Pressed, "#vp_vote_yes")
+    def on_vp_vote_yes(self):
+        self._apply_human_vote("赞成")
+
+    @on(Button.Pressed, "#vp_vote_no")
+    def on_vp_vote_no(self):
+        self._apply_human_vote("反对")
+
+    @on(Button.Pressed, "#vp_vote_abstain")
+    def on_vp_vote_abstain(self):
+        self._apply_human_vote("弃权")
+
+    @on(Button.Pressed, "#vp_resolve")
+    def on_vp_resolve(self):
+        self._apply_human_resolution(ViewpointStatus.RESOLVED)
+
+    @on(Button.Pressed, "#vp_reject")
+    def on_vp_reject(self):
+        self._apply_human_resolution(ViewpointStatus.REJECTED)
+
+    @on(Button.Pressed, "#vp_resume")
+    def on_vp_resume(self):
+        if not self._latest_state:
+            self._log_review("[yellow]⚠️ 没有可恢复的状态[/]")
+            return
+
+        if self._review_running:
+            self._log_review("[yellow]⚠️ 当前评审仍在运行[/]")
+            return
+
+        start_btn = self.query_one("#start_review_btn", Button)
+        stop_btn = self.query_one("#stop_review_btn", Button)
+        status = self.query_one("#review_status", Static)
+
+        start_btn.disabled = True
+        stop_btn.disabled = False
+        status.update("[yellow]恢复中...[/]")
+        self._review_running = True
+
+        self._latest_state["awaiting_human_input"] = False
+        self._latest_state["human_decision"] = {"action": "继续"}
+
+        self.run_review_with_state(self._latest_state)
 
 
 def run_textual_app():
